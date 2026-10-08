@@ -1,0 +1,257 @@
+import type { Message } from "@aws-sdk/client-sqs";
+import type { ProcessWagerTransaction } from "../../modules/wagering/application/process-wager-transaction";
+import type { ExternalWagerKind } from "../../modules/wagering/domain/wager-transaction-kind";
+import { type WagerMessage, WagerMessageContract } from "../../modules/wagering/infrastructure/contracts";
+import { ApplicationError } from "../../shared/application/errors";
+import { type AppLogger, type AppMetrics, logContext } from "../../shared/application/observability";
+import { computeBackoffMs } from "../../shared/domain/backoff";
+import { canonicalJson, type Json, sha256Hex } from "../../shared/domain/canonical-json";
+import type { FaultInjector } from "../workers/fault-injector";
+import type { SqsGateway } from "./sqs-gateway";
+
+export interface ConsumerSettings {
+  consumerName: string;
+  concurrency: number;
+  waitTimeSeconds: number;
+  visibilityTimeoutSeconds: number;
+  maxReceiveCount: number;
+  backoffBaseSeconds: number;
+  backoffMaxSeconds: number;
+}
+
+type Decision =
+  | { kind: "ack"; duplicate: boolean }
+  | { kind: "retry"; reason: string }
+  | { kind: "dlq"; reason: string; detail: string };
+
+/**
+ * Consumes `wager-transactions.fifo` and delegates to the same use case as HTTP.
+ *
+ *  - business outcome (PROCESSED/REJECTED/PENDING_REFERENCE) → committed → ack (delete)
+ *  - transient failure (DB/lock/connection) → visibility backoff; after maxReceiveCount the redrive policy moves
+ *    the message to the DLQ
+ *  - permanent failure (malformed message, idempotency conflict, unknown wallet) → explicit DLQ + delete
+ *
+ * Ack happens strictly after the SQL commit. A crash between commit and ack causes a redelivery, which the
+ * persistent inbox recognises (no second effect). Messages of the same MessageGroupId (wallet) inside a batch
+ * are processed sequentially to preserve order; different wallets run in parallel.
+ */
+export class SqsWagerConsumer {
+  private running = false;
+  private loop: Promise<void> | undefined;
+  private poll: AbortController | undefined;
+  private readonly inFlight = new Set<Promise<void>>();
+  private readonly pending = new Set<Message>();
+
+  constructor(
+    private readonly sqs: SqsGateway,
+    private readonly processWager: ProcessWagerTransaction,
+    private readonly settings: ConsumerSettings,
+    private readonly metrics: AppMetrics,
+    private readonly logger: AppLogger,
+    private readonly faults: FaultInjector,
+  ) {}
+
+  start(): void {
+    if (this.running) return;
+    this.running = true;
+    this.loop = this.run();
+    this.logger.info({ worker: "sqs-consumer", queue: this.sqs.settings.wagerQueueName }, "worker started");
+  }
+
+  /**
+   * Graceful stop (SIGTERM): stop polling, let in-flight messages finish within `graceMs`, and hand back
+   * every message we hold but have not started (visibility = 0) so another instance picks it up immediately.
+   */
+  async stop(graceMs: number): Promise<void> {
+    if (!this.running) return;
+    this.running = false;
+    this.poll?.abort();
+    await Promise.race([Promise.allSettled([...this.inFlight]), Bun.sleep(graceMs)]);
+    await Promise.allSettled([...this.pending].map((m) => this.release(m)));
+    await this.loop?.catch(() => {});
+    this.logger.info({ worker: "sqs-consumer", abandoned: this.inFlight.size }, "worker stopped");
+  }
+
+  private async run(): Promise<void> {
+    let failures = 0;
+    while (this.running) {
+      try {
+        if (this.inFlight.size >= this.settings.concurrency) {
+          await Promise.race(this.inFlight);
+          continue;
+        }
+        this.poll = new AbortController();
+        const messages = await this.sqs.receiveWagers(
+          this.settings.concurrency - this.inFlight.size,
+          this.settings.waitTimeSeconds,
+          this.poll.signal,
+        );
+        failures = 0;
+        if (!this.running) {
+          await Promise.allSettled(messages.map((m) => this.release(m)));
+          break;
+        }
+        for (const group of groupByMessageGroup(messages)) {
+          for (const m of group) this.pending.add(m);
+          const task = this.processGroup(group).finally(() => this.inFlight.delete(task));
+          this.inFlight.add(task);
+        }
+      } catch (error) {
+        if (!this.running) break;
+        failures++;
+        this.logger.warn({ err: error, failures }, "SQS receive failed");
+        await Bun.sleep(Math.min(1000 * 2 ** failures, 30_000));
+      }
+    }
+  }
+
+  private async processGroup(group: Message[]): Promise<void> {
+    for (const message of group) {
+      if (!this.running && this.pending.has(message)) continue; // left for release() on shutdown
+      this.pending.delete(message);
+      await this.handle(message);
+    }
+  }
+
+  private async handle(message: Message): Promise<void> {
+    const receiveCount = Number(message.Attributes?.ApproximateReceiveCount ?? 1);
+    const correlationId = message.MessageAttributes?.correlationId?.StringValue;
+    await logContext.run({ messageId: message.MessageId, correlationId, channel: "sqs" }, async () => {
+      const heartbeat = this.startHeartbeat(message);
+      let decision: Decision;
+      try {
+        decision = await this.decide(message);
+      } finally {
+        clearInterval(heartbeat);
+      }
+      await this.apply(message, decision, receiveCount);
+    });
+  }
+
+  private async decide(message: Message): Promise<Decision> {
+    let parsed: WagerMessage;
+    try {
+      const json: unknown = JSON.parse(message.Body ?? "");
+      const result = WagerMessageContract.safeParse(json);
+      if (!result.success) {
+        const detail = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
+        return { kind: "dlq", reason: "INVALID_MESSAGE", detail };
+      }
+      parsed = result.data;
+    } catch {
+      return { kind: "dlq", reason: "INVALID_JSON", detail: "body is not valid JSON" };
+    }
+
+    const { data } = parsed;
+    logContext.assign({
+      messageId: parsed.messageId,
+      correlationId: parsed.correlationId ?? logContext.get().correlationId ?? parsed.messageId,
+      providerId: data.providerId,
+      walletId: data.walletId,
+    });
+    try {
+      const { idempotencyKey, ...payload } = data;
+      const result = await this.processWager.execute({
+        ...payload,
+        kind: payload.kind as ExternalWagerKind,
+        idempotencyKey,
+        channel: "sqs",
+        correlationId: logContext.get().correlationId ?? parsed.messageId,
+        causationId: parsed.messageId,
+        inbox: {
+          consumerName: this.settings.consumerName,
+          // The envelope's business content; the same messageId with a different body is a conflict.
+          messageId: parsed.messageId,
+          payloadHash: `v1:${sha256Hex(canonicalJson(data as unknown as Json))}`,
+        },
+      });
+      // Committed. A crash right here is the "died after commit, before ack" scenario.
+      await this.faults.hit("after-commit-before-ack");
+      return { kind: "ack", duplicate: result.duplicateMessage };
+    } catch (error) {
+      if (error instanceof ApplicationError && error.kind !== "TRANSIENT") {
+        return { kind: "dlq", reason: error.code, detail: error.message };
+      }
+      const reason = error instanceof ApplicationError ? error.code : "UNEXPECTED_ERROR";
+      this.logger.warn({ err: error, reason }, "wager message failed transiently");
+      return { kind: "retry", reason };
+    }
+  }
+
+  private async apply(message: Message, decision: Decision, receiveCount: number): Promise<void> {
+    const handle = message.ReceiptHandle;
+    if (!handle) return;
+    try {
+      switch (decision.kind) {
+        case "ack":
+          await this.sqs.ack(handle);
+          this.metrics.sqsMessage(decision.duplicate ? "duplicate" : "ack");
+          return;
+        case "dlq":
+          await this.sqs.sendToDlq(message, decision.reason, decision.detail);
+          await this.sqs.ack(handle);
+          this.metrics.sqsMessage("dlq");
+          this.logger.error(
+            { reason: decision.reason, receiveCount },
+            "message dead-lettered (permanent failure)",
+          );
+          return;
+        case "retry": {
+          const delay = computeBackoffMs(receiveCount - 1, {
+            baseMs: this.settings.backoffBaseSeconds * 1000,
+            maxMs: this.settings.backoffMaxSeconds * 1000,
+            jitter: 0.3,
+          });
+          await this.sqs.changeVisibility(handle, delay / 1000);
+          this.metrics.sqsMessage(receiveCount >= this.settings.maxReceiveCount ? "dlq" : "retry");
+          this.logger.warn(
+            {
+              reason: decision.reason,
+              receiveCount,
+              retryInMs: delay,
+              maxReceiveCount: this.settings.maxReceiveCount,
+            },
+            receiveCount >= this.settings.maxReceiveCount
+              ? "retry budget exhausted; redrive policy will dead-letter the message"
+              : "message will be retried",
+          );
+          return;
+        }
+      }
+    } catch (error) {
+      // Ack/visibility failed: the message reappears after its visibility timeout and the inbox absorbs it.
+      this.logger.warn(
+        { err: error, decision: decision.kind },
+        "SQS settle call failed; relying on redelivery",
+      );
+    }
+  }
+
+  private startHeartbeat(message: Message): ReturnType<typeof setInterval> {
+    const every = Math.max(1, this.settings.visibilityTimeoutSeconds / 2) * 1000;
+    return setInterval(() => {
+      if (!message.ReceiptHandle) return;
+      this.sqs
+        .changeVisibility(message.ReceiptHandle, this.settings.visibilityTimeoutSeconds)
+        .catch(() => {});
+    }, every);
+  }
+
+  private async release(message: Message): Promise<void> {
+    if (!message.ReceiptHandle) return;
+    this.pending.delete(message);
+    await this.sqs.changeVisibility(message.ReceiptHandle, 0).catch(() => {});
+  }
+}
+
+function groupByMessageGroup(messages: Message[]): Message[][] {
+  const groups = new Map<string, Message[]>();
+  for (const m of messages) {
+    const key = m.Attributes?.MessageGroupId ?? m.MessageId ?? "";
+    const list = groups.get(key);
+    if (list) list.push(m);
+    else groups.set(key, [m]);
+  }
+  return [...groups.values()];
+}
