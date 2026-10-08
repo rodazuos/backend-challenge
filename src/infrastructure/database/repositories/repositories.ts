@@ -114,6 +114,21 @@ export class MikroWagerTransactionRepository implements WagerTransactionReposito
     return this.one({ providerId, externalTransactionId });
   }
 
+  async findIdempotencyCandidates(idempotencyKey: string, providerId: string, externalTransactionId: string) {
+    const rows = await this.em.find(
+      WagerTransactionRecord,
+      { $or: [{ idempotencyKey }, { providerId, externalTransactionId }] },
+      { disableIdentityMap: true, limit: 2 },
+    );
+    const txs = rows.map(wagerMapper.toDomain);
+    return {
+      byKey: txs.find((t) => t.idempotencyKey === idempotencyKey),
+      byExternal: txs.find(
+        (t) => t.providerId === providerId && t.externalTransactionId === externalTransactionId,
+      ),
+    };
+  }
+
   async lockById(id: string): Promise<WagerTransaction | undefined> {
     const row = await this.em.findOne(
       WagerTransactionRecord,
@@ -274,11 +289,17 @@ export class MikroInboxRepository implements InboxRepository {
 
   async tryInsert(message: InboxMessage): Promise<boolean> {
     const rows = await this.em.execute<{ message_id: string }[]>(
-      `INSERT INTO inbox_messages (consumer_name, message_id, payload_hash, received_at)
-       VALUES (?, ?, ?, ?)
+      `INSERT INTO inbox_messages (consumer_name, message_id, payload_hash, received_at, processed_at)
+       VALUES (?, ?, ?, ?, ?)
        ON CONFLICT (consumer_name, message_id) DO NOTHING
        RETURNING message_id`,
-      [message.consumerName, message.messageId, message.payloadHash, message.receivedAt],
+      [
+        message.consumerName,
+        message.messageId,
+        message.payloadHash,
+        message.receivedAt,
+        message.processedAt ?? null,
+      ],
     );
     return rows.length === 1;
   }
@@ -290,14 +311,6 @@ export class MikroInboxRepository implements InboxRepository {
       { disableIdentityMap: true },
     );
     return row ? inboxMapper.toDomain(row) : undefined;
-  }
-
-  async markProcessed(message: InboxMessage): Promise<void> {
-    await this.em.nativeUpdate(
-      InboxMessageRecord,
-      { consumerName: message.consumerName, messageId: message.messageId },
-      { processedAt: message.processedAt ?? null },
-    );
   }
 
   async purgeReceivedBefore(cutoff: Date, limit: number): Promise<number> {

@@ -103,9 +103,10 @@ export class ProcessWagerTransaction {
     const now = this.clock.now();
 
     // 1. Inbox: first statement, so a concurrent redelivery blocks here until we commit/rollback.
-    let inbox: InboxMessage | undefined;
+    //    The row only becomes visible at COMMIT, together with the effect, so it is written as processed.
     if (cmd.inbox) {
-      inbox = InboxMessage.receive({ ...cmd.inbox, receivedAt: now });
+      const inbox = InboxMessage.receive({ ...cmd.inbox, receivedAt: now });
+      inbox.markProcessed(now);
       const inserted = await scope.inbox.tryInsert(inbox);
       if (!inserted) return this.duplicateMessage(scope, cmd);
     }
@@ -115,7 +116,12 @@ export class ProcessWagerTransaction {
     if (!wallet) throw new WalletNotFoundForSubmissionError(cmd.walletId);
 
     // 3. Idempotency — evaluated *after* the lock, so a concurrent duplicate sees the committed original.
-    const existing = await scope.wagers.findByIdempotencyKey(cmd.idempotencyKey);
+    //    One round trip for both uniqueness keys (idempotency key, provider + external id).
+    const { byKey: existing, byExternal: sameExternal } = await scope.wagers.findIdempotencyCandidates(
+      cmd.idempotencyKey,
+      cmd.providerId,
+      cmd.externalTransactionId,
+    );
     if (existing) {
       if (!existing.matchesPayload(payloadHash)) {
         throw new IdempotencyConflictError("PAYLOAD_MISMATCH", {
@@ -123,13 +129,8 @@ export class ProcessWagerTransaction {
           transactionId: existing.id,
         });
       }
-      if (inbox) await scope.inbox.markProcessed(markProcessed(inbox, now));
       return toResult(existing, true);
     }
-    const sameExternal = await scope.wagers.findByProviderExternalId(
-      cmd.providerId,
-      cmd.externalTransactionId,
-    );
     if (sameExternal) {
       throw new IdempotencyConflictError("EXTERNAL_ID_REUSED", {
         providerId: cmd.providerId,
@@ -172,8 +173,6 @@ export class ProcessWagerTransaction {
     if (outcome.type === "PROCESSED") {
       await scope.wagers.nudgeDependents(wallet.id, tx.providerId, tx.externalTransactionId, now);
     }
-    if (inbox) await scope.inbox.markProcessed(markProcessed(inbox, now));
-
     return toResult(tx, false);
   }
 
@@ -280,9 +279,4 @@ export function toResult(tx: WagerTransaction, idempotentReplay: boolean): Submi
     idempotentReplay,
     duplicateMessage: false,
   };
-}
-
-function markProcessed(inbox: InboxMessage, at: Date): InboxMessage {
-  inbox.markProcessed(at);
-  return inbox;
 }

@@ -87,6 +87,17 @@ describe("Wallet", () => {
     expect(wallet.version).toBe(1);
   });
 
+  test("updatedAt stays monotonic when another instance's clock is behind (clock skew)", () => {
+    const wallet = openWallet("100.00"); // created at T0 by "instance A"
+    const skewed = new Date(T0.getTime() - 125); // "instance B" clock 125 ms behind
+    wallet.debit({ ...move("1.00"), at: skewed });
+    expect(wallet.updatedAt.getTime()).toBe(T0.getTime());
+    expect(wallet.updatedAt >= wallet.createdAt).toBe(true);
+    const later = new Date(T0.getTime() + 1000);
+    wallet.debit({ ...move("1.00"), at: later });
+    expect(wallet.updatedAt).toEqual(later);
+  });
+
   test("rehydrate restores state without re-validating", () => {
     const wallet = Wallet.rehydrate({
       id: "w",

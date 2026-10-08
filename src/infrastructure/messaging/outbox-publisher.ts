@@ -12,6 +12,8 @@ export interface OutboxPublisherSettings {
   batchSize: number;
   leaseMs: number;
   pollIntervalMs: number;
+  /** Parallel publish lanes (partitioned by aggregateId to keep per-wallet order). */
+  lanes: number;
 }
 
 /**
@@ -66,17 +68,34 @@ export class OutboxPublisher extends PollingWorker {
   private async publishClaimed(claimed: OutboxMessage[]): Promise<number> {
     await this.faults.hit("after-claim-before-publish");
 
+    // Lanes partitioned by aggregate: each wallet's events stay in one lane, published sequentially in seq order,
+    // while different lanes publish in parallel. A failure stops its lane (the rest is retried later) so one
+    // wallet's events are never published around a gap.
     const failed = new Map<string, string>();
-    for (let i = 0; i < claimed.length; i += 10) {
-      const chunk = claimed.slice(i, i + 10);
-      try {
-        const { failedIds } = await this.sqs.publishEvents(chunk.map(toOutgoing));
-        for (const id of failedIds) failed.set(id, "rejected by broker");
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        for (const m of chunk) failed.set(m.id, message);
-      }
+    const lanes = new Map<number, OutboxMessage[]>();
+    for (const m of claimed) {
+      const lane = laneOf(m.aggregateId, this.settings.lanes);
+      const list = lanes.get(lane);
+      if (list) list.push(m);
+      else lanes.set(lane, [m]);
     }
+    await Promise.all(
+      [...lanes.values()].map(async (messages) => {
+        for (let i = 0; i < messages.length; i += 10) {
+          const chunk = messages.slice(i, i + 10);
+          try {
+            const { failedIds } = await this.sqs.publishEvents(chunk.map(toOutgoing));
+            if (failedIds.length === 0) continue;
+            for (const id of failedIds) failed.set(id, "rejected by broker");
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            for (const m of chunk) failed.set(m.id, message);
+          }
+          for (const m of messages.slice(i + 10)) failed.set(m.id, "lane halted after a failure");
+          return;
+        }
+      }),
+    );
     await this.faults.hit("after-publish-before-mark");
 
     const publishedAt = this.clock.now();
@@ -118,6 +137,16 @@ export class OutboxPublisher extends PollingWorker {
       .transaction((s) => s.outbox.releaseLeases(this.settings.owner), { label: "outbox-release" })
       .catch((error) => this.logger.warn({ err: error }, "could not release outbox leases"));
   }
+}
+
+/** Stable FNV-1a hash of the aggregate id → lane index. */
+function laneOf(aggregateId: string, lanes: number): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < aggregateId.length; i++) {
+    h ^= aggregateId.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0) % Math.max(1, lanes);
 }
 
 function toOutgoing(m: OutboxMessage): OutgoingEvent {

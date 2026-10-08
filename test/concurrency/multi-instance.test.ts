@@ -140,14 +140,18 @@ describe("multiple instances", () => {
   }, 120_000);
 
   test("5. consumer killed after the commit and before the ack: redelivery is absorbed, no double debit", async () => {
+    // Dedicated queues: no leftover redelivery from other scenarios can reach the victim first.
+    const own = testQueues("crash");
+    const ownSqs = await ensureQueues({ ...baseEnv, ...own });
     const victim = await start("victim", {
+      ...own,
       APP_ROLES: "consumer",
       FAULT_INJECTION: "after-commit-before-ack",
     });
-    const api = await start("api-only", { APP_ROLES: "api" });
+    const api = await start("api-only", { ...own, APP_ROLES: "api" });
     const w = await createWallet(api.url, "100.00");
     const msg = wagerMessage(w, "BET", "40.00");
-    await sendWager(sqs, msg);
+    await sendWager(ownSqs, msg);
 
     expect(await victim.exited).not.toBe(0); // died right after COMMIT
     expect(victim.logs.some((l) => l.includes("after-commit-before-ack"))).toBe(true);
@@ -155,9 +159,9 @@ describe("multiple instances", () => {
     expect(await debitsOf(w.id)).toBe(1);
 
     // A healthy instance picks the message up once its visibility expires.
-    await start("rescuer", { APP_ROLES: "consumer" });
+    await start("rescuer", { ...own, APP_ROLES: "consumer" });
     await waitFor(
-      async () => ((await sqs.queueDepth(queues.SQS_WAGER_QUEUE_NAME)) === 0 ? true : undefined),
+      async () => ((await ownSqs.queueDepth(own.SQS_WAGER_QUEUE_NAME)) === 0 ? true : undefined),
       {
         what: "redelivered message acked",
         timeoutMs: 30_000,
@@ -168,6 +172,7 @@ describe("multiple instances", () => {
     const view = await http<{ balance: { amount: string } }>(api.url, "GET", `/wallets/${w.id}`);
     expect(view.body.balance.amount).toBe("60.00");
     await assertWalletConsistent(db, w.id);
+    ownSqs.destroy();
   }, 60_000);
 
   test("6. two publishers on the same outbox, one crashing mid-flight: everything is published, duplicates are safe", async () => {

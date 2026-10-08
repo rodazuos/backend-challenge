@@ -8,6 +8,12 @@ export interface ClaimedPendingReference {
 export interface WagerTransactionRepository {
   findById(id: string): Promise<WagerTransaction | undefined>;
   findByIdempotencyKey(key: string): Promise<WagerTransaction | undefined>;
+  /** Single round trip for both uniqueness keys: by idempotency key and by (providerId, externalTransactionId). */
+  findIdempotencyCandidates(
+    idempotencyKey: string,
+    providerId: string,
+    externalTransactionId: string,
+  ): Promise<{ byKey?: WagerTransaction; byExternal?: WagerTransaction }>;
   findByProviderExternalId(
     providerId: string,
     externalTransactionId: string,

@@ -2,10 +2,9 @@ import type { InboxMessage } from "../domain/inbox-message";
 import type { OutboxMessage } from "../domain/outbox-message";
 
 export interface InboxRepository {
-  /** INSERT … ON CONFLICT DO NOTHING. Returns false when (consumer, messageId) already exists. */
+  /** INSERT … ON CONFLICT DO NOTHING (processed_at included). Returns false when (consumer, messageId) exists. */
   tryInsert(message: InboxMessage): Promise<boolean>;
   find(consumerName: string, messageId: string): Promise<InboxMessage | undefined>;
-  markProcessed(message: InboxMessage): Promise<void>;
   purgeReceivedBefore(cutoff: Date, limit: number): Promise<number>;
 }
 

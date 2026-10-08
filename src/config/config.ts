@@ -48,7 +48,8 @@ const EnvSchema = z.object({
   SQS_CONSUMER_NAME: z.string().default("wagering-processor"),
 
   OUTBOX_POLL_INTERVAL_MS: int(250, 10),
-  OUTBOX_BATCH_SIZE: int(50, 1),
+  OUTBOX_BATCH_SIZE: int(100, 1),
+  OUTBOX_PUBLISH_LANES: int(4, 1),
   OUTBOX_LEASE_MS: int(30_000, 100),
 
   PENDING_REF_POLL_INTERVAL_MS: int(1000, 10),

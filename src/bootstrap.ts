@@ -105,6 +105,7 @@ export async function startApplication(config: AppConfig): Promise<RunningApplic
           batchSize: config.OUTBOX_BATCH_SIZE,
           leaseMs: config.OUTBOX_LEASE_MS,
           pollIntervalMs: config.OUTBOX_POLL_INTERVAL_MS,
+          lanes: config.OUTBOX_PUBLISH_LANES,
         },
         metrics,
         logger,

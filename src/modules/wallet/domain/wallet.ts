@@ -141,7 +141,9 @@ export class Wallet {
 
     this._balance = after;
     this._version += 1;
-    this._updatedAt = props.at;
+    // Instances have independent clocks (skew of 100+ ms was observed under load): wall-clock time is
+    // informational only — ordering is by version — so updatedAt is kept monotonic and never before createdAt.
+    this._updatedAt = props.at > this._updatedAt ? props.at : this._updatedAt;
     return entry;
   }
 

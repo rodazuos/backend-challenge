@@ -43,7 +43,7 @@ const publisher = (owner: string, leaseMs = 2000) =>
     app.core.uow,
     sqs,
     app.core.clock,
-    { owner, batchSize: 7, leaseMs, pollIntervalMs: 20 },
+    { owner, batchSize: 7, leaseMs, pollIntervalMs: 20, lanes: 3 },
     noopMetrics,
     silentLogger,
     new FaultInjector([]),
