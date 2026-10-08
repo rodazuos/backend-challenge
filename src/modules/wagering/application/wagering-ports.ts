@@ -1,3 +1,4 @@
+import type { SubmissionFailure } from "../domain/submission-failure";
 import type { WagerTransaction } from "../domain/wager-transaction";
 
 export interface ClaimedPendingReference {
@@ -38,4 +39,17 @@ export interface WagerTransactionRepository {
    */
   claimDuePendingReferences(now: Date, limit: number, leaseUntil: Date): Promise<ClaimedPendingReference[]>;
   countPendingReferences(): Promise<number>;
+}
+
+/** Append-only audit of submissions that did not become a business outcome. */
+export interface SubmissionFailureRepository {
+  insert(failure: SubmissionFailure): Promise<void>;
+  /** Newest first. */
+  listByExternalId(
+    providerId: string,
+    externalTransactionId: string,
+    limit: number,
+  ): Promise<SubmissionFailure[]>;
+  /** Retention: deletes records older than `cutoff` (rows are immutable otherwise). */
+  purgeOccurredBefore(cutoff: Date, limit: number): Promise<number>;
 }

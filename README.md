@@ -19,7 +19,8 @@ Serviço financeiro distribuído que processa transações de apostas (`BET`, `W
 - **Concorrência por wallet.** Usa `SELECT … FOR UPDATE` por wallet, com `version` como defesa em profundidade. Não há lock global e não há deadlock entre wallets.
 - **Idempotência persistente.** A chave de idempotência e o par (provider, externalId) são únicos no banco. Há inbox por `(consumer, messageId)` para SQS, e o replay devolve o resultado original.
 - **Outbox transacional.** Publishers concorrentes coordenam o trabalho por lease (`SKIP LOCKED`). Um publisher que cai é substituído automaticamente quando a lease expira.
-- **Testes com infraestrutura real.** São 175 testes, com PostgreSQL e SQS reais. Incluem 3 processos Bun simultâneos, `SIGKILL` entre o commit e o ack, publishers que caem no meio do envio e restart com reconciliação final.
+- **Auditoria de recusas.** Toda submissão que não vira resultado de negócio (payload inválido, conflito, wallet inexistente, retries esgotados) fica registrada, emite um evento e é consultável pelo provedor, sem ocupar a chave de idempotência. Erros inesperados que esgotam as tentativas viram `FAILED` auditável.
+- **Testes com infraestrutura real.** São 193 testes, com PostgreSQL e SQS reais. Incluem 3 processos Bun simultâneos, `SIGKILL` entre o commit e o ack, publishers que caem no meio do envio e restart com reconciliação final.
 
 ## Início rápido (stack completa)
 
@@ -84,6 +85,7 @@ Todas as respostas de erro usam `{ code, message, details?, correlationId }`. A 
 | `POST /wagering/transactions` | submete uma transação (header `Idempotency-Key` obrigatório) |
 | `GET /wagering/transactions/:transactionId` | consulta por id interno |
 | `GET /providers/:providerId/wagering/transactions/:externalTransactionId` | consulta por id do provedor |
+| `GET /providers/:providerId/wagering/transactions/:externalTransactionId/failures` | recusas auditadas dessa transação (motivo, categoria, se é `retryable`), mais recentes primeiro |
 | `GET /health/live` · `GET /health/ready` · `GET /metrics` | liveness, readiness (PostgreSQL + SQS) e Prometheus; sem autenticação |
 
 ```bash
@@ -107,6 +109,7 @@ Toda a configuração vem do ambiente e é validada com zod no boot. Exemplos es
 | `DB_LOCK_TIMEOUT_MS` | `2000` | espera máxima pelo lock da wallet; depois disso o erro é transitório (503 / retry na fila) |
 | `SQS_MAX_RECEIVE_COUNT` | `5` | tentativas antes da DLQ (redrive policy) |
 | `PENDING_REF_BASE_MS` · `PENDING_REF_MAX_MS` · `PENDING_REF_MAX_ATTEMPTS` | `2000` · `300000` · `10` | backoff de referências fora de ordem (~35 min) |
+| `SUBMISSION_FAILURE_RETENTION_DAYS` | `90` | retenção da auditoria de recusas |
 | `OTEL_ENABLED` | `false` | tracing OTLP (HTTP, PostgreSQL, SQS, outbox) |
 
 ## Estrutura

@@ -13,7 +13,7 @@ import { SqsGateway } from "./infrastructure/messaging/sqs-gateway";
 import { SqsWagerConsumer } from "./infrastructure/messaging/sqs-wager-consumer";
 import { createLogger, type Logger, NestPinoLogger } from "./infrastructure/observability/logger";
 import { PromMetrics } from "./infrastructure/observability/metrics";
-import { InboxPurgeWorker, PendingReferenceWorker } from "./infrastructure/workers/background-workers";
+import { PendingReferenceWorker, RetentionWorker } from "./infrastructure/workers/background-workers";
 import { FaultInjector } from "./infrastructure/workers/fault-injector";
 
 export interface RunningApplication {
@@ -81,6 +81,7 @@ export async function startApplication(config: AppConfig): Promise<RunningApplic
     ? new SqsWagerConsumer(
         sqs,
         core.processWager,
+        core.recordSubmissionFailure,
         {
           consumerName: config.SQS_CONSUMER_NAME,
           concurrency: config.SQS_CONSUMER_CONCURRENCY,
@@ -121,7 +122,15 @@ export async function startApplication(config: AppConfig): Promise<RunningApplic
       )
     : undefined;
   const inboxPurge = roles.has("consumer")
-    ? new InboxPurgeWorker(core.uow, core.clock, config.INBOX_RETENTION_DAYS, logger)
+    ? new RetentionWorker(
+        core.uow,
+        core.clock,
+        {
+          inboxDays: config.INBOX_RETENTION_DAYS,
+          submissionFailureDays: config.SUBMISSION_FAILURE_RETENTION_DAYS,
+        },
+        logger,
+      )
     : undefined;
 
   const app = await NestFactory.create<NestExpressApplication>(

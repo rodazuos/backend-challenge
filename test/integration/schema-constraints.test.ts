@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { runMigrations } from "../../src/infrastructure/database/migrate";
+import { MIGRATIONS } from "../../src/infrastructure/database/migrations";
 import { createTestDatabase, type TestDatabase } from "../helpers/test-db";
 
 /**
@@ -103,7 +104,7 @@ describe("migrations", () => {
   test("are reversible: down then up again on a scratch database", async () => {
     const scratch = await createTestDatabase();
     try {
-      await runMigrations(scratch.migratorUrl, "down", 2);
+      await runMigrations(scratch.migratorUrl, "down", MIGRATIONS.length); // revert everything
       const [{ n }] = (await scratch.query<{ n: string }>(
         "SELECT COUNT(*)::text AS n FROM pg_tables WHERE schemaname = 'public' AND tablename = 'wallets'",
       )) as [{ n: string }];
@@ -118,6 +119,7 @@ describe("migrations", () => {
           "outbox_messages",
           "wager_transactions",
           "ledger_postings",
+          "wager_submission_failures",
           "wallet_ledger_entries",
           "wallets",
         ]),

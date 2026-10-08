@@ -125,6 +125,31 @@ export const LedgerPostingRecordSchema = defineEntity({
 export class LedgerPostingRecord extends LedgerPostingRecordSchema.class {}
 LedgerPostingRecordSchema.setClass(LedgerPostingRecord);
 
+export const SubmissionFailureRecordSchema = defineEntity({
+  name: "SubmissionFailureRecord",
+  tableName: "wager_submission_failures",
+  properties: {
+    id: p.uuid().primary(),
+    channel: p.string(),
+    reasonCode: p.string(),
+    category: p.string(),
+    retryable: p.boolean(),
+    providerId: p.string().nullable(),
+    externalTransactionId: p.string().nullable(),
+    idempotencyKey: p.string().nullable(),
+    walletId: p.uuid().nullable(),
+    messageId: p.string().nullable(),
+    transactionId: p.uuid().nullable(),
+    payloadHash: p.string().nullable(),
+    detail: p.string().nullable(),
+    receiveCount: p.integer().nullable(),
+    correlationId: p.string().nullable(),
+    occurredAt: p.datetime(),
+  },
+});
+export class SubmissionFailureRecord extends SubmissionFailureRecordSchema.class {}
+SubmissionFailureRecordSchema.setClass(SubmissionFailureRecord);
+
 export const ALL_ENTITIES = [
   WalletRecordSchema,
   WagerTransactionRecordSchema,
@@ -132,4 +157,5 @@ export const ALL_ENTITIES = [
   InboxMessageRecordSchema,
   OutboxMessageRecordSchema,
   LedgerPostingRecordSchema,
+  SubmissionFailureRecordSchema,
 ];

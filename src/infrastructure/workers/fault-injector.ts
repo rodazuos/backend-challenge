@@ -8,6 +8,9 @@ export type FaultPoint =
   | "after-claim-before-publish"
   | "after-publish-before-mark";
 
+/** Points that throw an unexpected error instead of crashing (simulates a defect). */
+export type ErrorFaultPoint = "consumer-unexpected-error";
+
 export class FaultInjector {
   private readonly points: ReadonlySet<string>;
 
@@ -17,6 +20,10 @@ export class FaultInjector {
 
   get enabled(): boolean {
     return this.points.size > 0;
+  }
+
+  throwIf(point: ErrorFaultPoint): void {
+    if (this.points.has(point)) throw new Error(`fault injection: ${point}`);
   }
 
   async hit(point: FaultPoint): Promise<void> {

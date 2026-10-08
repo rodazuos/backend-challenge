@@ -5,6 +5,10 @@ import { buildOrmConfig } from "../infrastructure/database/orm-config";
 import { ProcessWagerTransaction } from "../modules/wagering/application/process-wager-transaction";
 import { ReferenceRetryPolicy } from "../modules/wagering/application/reference-retry-policy";
 import { ResolvePendingReferences } from "../modules/wagering/application/resolve-pending-references";
+import {
+  ListSubmissionFailures,
+  RecordSubmissionFailure,
+} from "../modules/wagering/application/submission-failures";
 import { GetWagerTransaction } from "../modules/wagering/application/wager-queries";
 import {
   CreateWallet,
@@ -32,6 +36,8 @@ export interface Core {
   listLedger: ListWalletLedger;
   reconcileWallet: ReconcileWallet;
   getWager: GetWagerTransaction;
+  recordSubmissionFailure: RecordSubmissionFailure;
+  listSubmissionFailures: ListSubmissionFailures;
   close(): Promise<void>;
 }
 
@@ -103,6 +109,8 @@ export async function buildCore(
     listLedger: new ListWalletLedger(uow),
     reconcileWallet: new ReconcileWallet(uow, clock, deps.metrics, deps.logger),
     getWager: new GetWagerTransaction(uow),
+    recordSubmissionFailure: new RecordSubmissionFailure(uow, clock, ids, deps.metrics, deps.logger),
+    listSubmissionFailures: new ListSubmissionFailures(uow),
     close: () => orm.close(true),
   };
 }

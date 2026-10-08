@@ -60,6 +60,7 @@ const EnvSchema = z.object({
   PENDING_REF_LEASE_MS: int(30_000, 100),
 
   INBOX_RETENTION_DAYS: int(30, 1),
+  SUBMISSION_FAILURE_RETENTION_DAYS: int(90, 1),
   SHUTDOWN_GRACE_MS: int(20_000, 0),
 
   OTEL_ENABLED: bool.default(false),

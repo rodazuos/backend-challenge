@@ -14,7 +14,9 @@ import { DomainError } from "../../../shared/domain/domain-error";
 import { Money, type MoneyProps } from "../../../shared/domain/money";
 import type { Clock, IdGenerator } from "../../../shared/domain/ports";
 import { InboxMessage } from "../../messaging/domain/inbox-message";
+import { OutboxMessage } from "../../messaging/domain/outbox-message";
 import { counterpartyAccountFor } from "../domain/counterparty";
+import { WagerTransactionFailed } from "../domain/events/wagering-events";
 import type { FailureCode } from "../domain/failure-code";
 import { computeWagerPayloadHash } from "../domain/payload-hash";
 import { type ReferenceLookup, WagerProcessor } from "../domain/wager-processor";
@@ -92,6 +94,61 @@ export class ProcessWagerTransaction {
 
     this.record(cmd, result, started);
     return result;
+  }
+
+  /**
+   * Records the submission as FAILED (terminal, auditable, no balance effect) after an *unexpected* error exhausted
+   * its retries. Deliberately not used for transient infrastructure failures: those stay recoverable (DLQ redrive,
+   * provider resend) instead of being frozen as a permanent answer for the idempotency key.
+   *
+   * Returns undefined when there is nothing valid to record against (unknown wallet, invalid contract), and the
+   * existing transaction when the key was meanwhile processed (FAILED never overwrites a real outcome).
+   */
+  async markFailed(cmd: SubmitWagerCommand, code: FailureCode): Promise<SubmitWagerResult | undefined> {
+    let money: Money;
+    try {
+      money = this.parseMoney(cmd.money);
+    } catch {
+      return undefined;
+    }
+    const payloadHash = computeWagerPayloadHash(cmd);
+    return this.uow.transaction(
+      async (scope) => {
+        const now = this.clock.now();
+        const wallet = await scope.wallets.lockById(cmd.walletId);
+        if (!wallet) return undefined;
+        const { byKey, byExternal } = await scope.wagers.findIdempotencyCandidates(
+          cmd.idempotencyKey,
+          cmd.providerId,
+          cmd.externalTransactionId,
+        );
+        const existing = byKey ?? byExternal;
+        if (existing) return toResult(existing, true);
+
+        let tx: WagerTransaction;
+        try {
+          tx = this.createTransaction(cmd, money, payloadHash, now);
+        } catch {
+          return undefined;
+        }
+        tx.fail(code, now, wallet.balance);
+        await scope.wagers.insert(tx);
+        await scope.outbox.add([
+          OutboxMessage.enqueue(
+            WagerTransactionFailed.from(tx, {
+              eventId: this.ids.next(),
+              correlationId: cmd.correlationId,
+              causationId: cmd.causationId,
+              occurredAt: now,
+            }),
+          ),
+        ]);
+        this.metrics.transactionOutcome({ kind: cmd.kind, status: tx.status, channel: cmd.channel });
+        this.logger.error({ transactionId: tx.id, failureCode: code }, "wager transaction marked FAILED");
+        return toResult(tx, false);
+      },
+      { label: "mark-wager-failed" },
+    );
   }
 
   private async run(

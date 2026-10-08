@@ -1,5 +1,8 @@
 import type { InboxRepository, OutboxRepository } from "../../modules/messaging/application/messaging-ports";
-import type { WagerTransactionRepository } from "../../modules/wagering/application/wagering-ports";
+import type {
+  SubmissionFailureRepository,
+  WagerTransactionRepository,
+} from "../../modules/wagering/application/wagering-ports";
 import type { LedgerRepository, WalletRepository } from "../../modules/wallet/application/wallet-ports";
 
 /** Repositories bound to one SQL transaction. */
@@ -9,6 +12,7 @@ export interface TransactionScope {
   ledger: LedgerRepository;
   inbox: InboxRepository;
   outbox: OutboxRepository;
+  failures: SubmissionFailureRepository;
 }
 
 export interface TransactionOptions {

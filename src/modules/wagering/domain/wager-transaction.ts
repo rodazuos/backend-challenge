@@ -230,10 +230,12 @@ export class WagerTransaction {
     this._nextReferenceRetryAt = undefined;
   }
 
-  fail(code: FailureCode, at: Date): void {
+  /** Permanent infrastructure failure, kept for audit. `resultBalance` is the balance observed (unchanged). */
+  fail(code: FailureCode, at: Date, resultBalance?: Money): void {
     this.transitionTo(WagerTransactionStatus.Failed);
     this._failureCode = code;
     this._processedAt = at;
+    this._resultBalance = resultBalance;
     this._nextReferenceRetryAt = undefined;
   }
 

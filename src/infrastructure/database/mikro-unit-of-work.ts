@@ -9,6 +9,7 @@ import {
   MikroInboxRepository,
   MikroLedgerRepository,
   MikroOutboxRepository,
+  MikroSubmissionFailureRepository,
   MikroWagerTransactionRepository,
   MikroWalletRepository,
   OptimisticConcurrencyError,
@@ -27,6 +28,7 @@ function scopeFor(em: EntityManager): TransactionScope {
     ledger: new MikroLedgerRepository(em),
     inbox: new MikroInboxRepository(em),
     outbox: new MikroOutboxRepository(em),
+    failures: new MikroSubmissionFailureRepository(em),
   };
 }
 

@@ -131,8 +131,10 @@ O Nest é só a casca HTTP/DI. O núcleo é montado sem framework em `src/compos
 - **Mesmo use case** do HTTP. O ack (`DeleteMessage`) acontece **somente após o commit**.
 - **Classificação:**
   - **negócio** (PROCESSED, REJECTED, PENDING_REFERENCE): commit e ack;
-  - **transitório**: `ChangeMessageVisibility` com backoff baseado em `ApproximateReceiveCount`; depois de `maxReceiveCount = 5`, a redrive policy leva a mensagem à DLQ;
-  - **permanente** (JSON inválido, schema inválido, conflito de idempotência, wallet inexistente): envio explícito à DLQ com atributo `failureReason`, seguido de delete.
+  - **transitório**: `ChangeMessageVisibility` com backoff baseado em `ApproximateReceiveCount`. Na última tentativa permitida (`maxReceiveCount = 5`), a falha é auditada como `RETRIES_EXHAUSTED` (`retryable: true`) e a mensagem vai explicitamente para a DLQ. Ela continua recuperável por redrive;
+  - **erro inesperado** (defeito) na última tentativa: a transação vira `FAILED(INFRA_PERMANENT_FAILURE)`, é auditada e vai para a DLQ (veja o ADR-12);
+  - **permanente** (JSON inválido, schema inválido, conflito de idempotência, wallet inexistente): auditoria, envio explícito à DLQ com atributo `failureReason` e delete.
+- Toda mensagem que vai para a DLQ deixa uma linha de auditoria e um evento `WagerSubmissionFailed`. A redrive policy continua como rede de segurança para mensagens que derrubam o próprio consumidor.
 - Mensagens do mesmo `MessageGroupId` (wallet) dentro de um lote são processadas **em sequência**; grupos diferentes, em paralelo. O FIFO do broker é otimização de ordem, não garantia de consistência.
 - Há um heartbeat de visibilidade para processamentos longos.
 - **`SIGTERM`:**
@@ -177,7 +179,8 @@ Autenticação não pontua, então o tempo foi para correção. Existe `Provider
   - `db_transient_retries_total`, `db_lock_conflicts_total`;
   - `sqs_messages_total{result=ack|retry|dlq|duplicate}`, `sqs_dlq_depth`;
   - `outbox_lag_seconds` (idade do evento mais antigo não publicado), `outbox_publish_lag_seconds` (commit → broker), `outbox_pending_messages`;
-  - `wager_processing_duration_seconds`, `pending_reference_transactions`, `reconciliation_mismatches_total`.
+  - `wager_processing_duration_seconds`, `pending_reference_transactions`, `reconciliation_mismatches_total`;
+  - `wager_submission_failures_total{channel,reason}` (auditoria, ADR-12).
 - **Health:** `live` é só o processo, porque uma queda do banco não deve reiniciar pods. `ready` checa PostgreSQL e SQS com timeout e cache de 2 s, e responde 503 durante o shutdown.
 - **Tracing:** OpenTelemetry via `--preload`. Inclui auto-instrumentação de HTTP e `pg` (validada no Bun) e spans manuais de consumo SQS e outbox. O W3C trace context é propagado em atributos SQS. Fica desligado por padrão.
 - **Dashboard** Grafana provisionado com 14 painéis: lag, DLQ, latência p50/p95/p99, idempotência, locks, outbox e event loop.
@@ -187,6 +190,53 @@ Autenticação não pontua, então o tempo foi para correção. Existe `Provider
 Desde março de 2026 a imagem da LocalStack exige *auth token*, inclusive no antigo plano Community. O MiniStack (MIT) foi validado num spike para tudo o que o desafio precisa: FIFO, deduplicação, `ApproximateReceiveCount`, `ChangeMessageVisibility` e redrive para DLQ.
 
 Há uma ressalva: em envios deduplicados, o MiniStack devolve o MD5 da mensagem **original**, o que dispara `InvalidChecksumError` no SDK. A verificação de MD5 é desligada **só** quando `SQS_VERIFY_MD5=false` (emuladores). O endpoint é configurável, e trocar por LocalStack ou AWS real é questão de variável de ambiente.
+
+### ADR-12 — Auditoria de submissões recusadas e status `FAILED`
+
+**Problema.** Na primeira versão, uma submissão que não virava resultado de negócio (payload inválido, conflito de idempotência, wallet inexistente, mensagem envenenada, retries esgotados) deixava rastro só na DLQ e nos logs. Isso tinha dois defeitos:
+- **o provedor não tinha como saber o que aconteceu**, sobretudo no canal SQS, que não recebe resposta síncrona;
+- **a auditoria dependia de infraestrutura volátil**: a DLQ tem retenção limitada e os logs não são consultáveis pelo cliente.
+
+**Por que não gravar tudo como `FAILED` em `wager_transactions`.** Essa foi a primeira ideia, e foi descartada caso a caso:
+
+| Caso | Por que não cabe como linha `FAILED` |
+|---|---|
+| Payload ou mensagem malformados | não há identidade válida (wallet, provider, chave) para gravar |
+| Conflito de idempotência | a chave já pertence à transação original (`UNIQUE`) |
+| Wallet inexistente | a FK `wallet_id → wallets` impede a linha |
+| Falha transitória esgotada (banco fora por minutos) | `FAILED` é **terminal**: com idempotência, todo reenvio com a mesma chave devolveria `FAILED` para sempre, transformando um problema recuperável numa resposta definitiva |
+
+**Decisão.** São dois mecanismos, cada um com o seu papel:
+
+1. **`wager_submission_failures`: trilha de auditoria fora do estado financeiro.**
+   - O que registra: canal; `reasonCode` estável; categoria (`VALIDATION`, `CONFLICT`, `UNPROCESSABLE` ou `INFRASTRUCTURE`); se é `retryable`; os identificadores conhecidos (provider, externalId, chave, wallet, messageId); hash do payload quando válido; detalhe truncado; `receiveCount`; `correlationId`.
+   - **Não ocupa a chave de idempotência.** O provedor pode corrigir e reenviar com a mesma chave, e isso está testado.
+   - As linhas são **imutáveis** (trigger bloqueia `UPDATE`). `DELETE` é permitido só para retenção (`SUBMISSION_FAILURE_RETENTION_DAYS`, padrão 90 dias).
+   - Os identificadores são **sanitizados no domínio**: só valores bem formados entram, então lixo enviado por um cliente quebrado ou mal-intencionado não chega ao banco. Valores e payloads não são armazenados, só o hash.
+   - O registro roda numa transação **separada** e é **best-effort**: se o banco for o problema, o erro original ainda chega ao cliente.
+   - Cada registro gera, na mesma transação, o evento **`WagerSubmissionFailed`** via outbox. É assim que um provedor do canal SQS fica sabendo da recusa.
+   - O provedor consulta em `GET /providers/:providerId/wagering/transactions/:externalTransactionId/failures`.
+   - Falhas transitórias no **HTTP** (503) não são auditadas: o cliente já recebeu a resposta síncrona com `Retry-After`, as métricas contam, e gravar uma linha por tentativa durante um incidente de banco só aumentaria a carga.
+2. **`FAILED` em `wager_transactions` só para defeito confirmado.** Um erro **inesperado**, que não é de negócio nem transitório conhecido, e que sobreviveu a todas as tentativas no SQS indica bug. Nesse caso:
+   - a transação é gravada como `FAILED(INFRA_PERMANENT_FAILURE)` com o saldo observado (inalterado) e **sem ledger**;
+   - o evento `WagerTransactionFailed` é emitido;
+   - a auditoria aponta o `transactionId`;
+   - o replay devolve `422` com `status: FAILED`.
+
+   Assim o provedor recebe uma resposta definitiva, em vez de silêncio. `FAILED` nunca sobrescreve um resultado real: se a chave já tiver uma transação, ela é devolvida.
+
+**Efeito colateral corrigido:** a métrica `wager_idempotency_conflicts_total` existia, mas não era incrementada. Agora a auditoria a alimenta.
+
+### ADR-13 — Cache (Redis): avaliado e não adotado
+
+O teste de carga mostrou que o processo é **I/O-bound no caminho de escrita**: o app fica ocioso ~93% do tempo, esperando os round-trips ao PostgreSQL feitos sob o lock da wallet. Um cache não alivia esse caminho:
+- **não pode** garantir idempotência (restrição 2 do enunciado);
+- **não pode** fornecer o saldo para decisões, que precisa ser lido sob o lock;
+- um lock distribuído no Redis acrescentaria um ponto de falha sem dispensar o lock do banco.
+
+Usos legítimos existiriam: transações terminais e páginas antigas do ledger, que são imutáveis; o saldo para exibição invalidado por `WalletBalanceChanged`; um atalho de replay; e rate limiting no gateway. Mas atendem leituras e cenários que não são o gargalo medido.
+
+**Decisão:** não introduzir Redis agora. Ele teria custo operacional (mais um componente e mais um modo de falha) sem ganho no caminho crítico. As alavancas reais de vazão estão na seção 8.
 
 ---
 
@@ -215,6 +265,7 @@ Migrations escritas à mão, versionadas e reversíveis (`up`/`down`, testadas),
 | Coerência de estado | `CHECK`: REFUND/ROLLBACK exigem referência; REJECTED/FAILED ⇔ `failure_code`; terminal ⇔ `processed_at`; PENDING_REFERENCE ⇔ `next_reference_retry_at` |
 | Journal balanceado | constraint trigger diferido `ledger_postings_balanced` |
 | Inbox | `PK (consumer_name, message_id)` |
+| Auditoria de recusas imutável, fora do estado financeiro | `wager_submission_failures` + trigger que bloqueia `UPDATE`; `CHECK` de canal, categoria e formato do `reason_code`; o role de runtime tem só `SELECT, INSERT, DELETE` (retenção) |
 
 Todas essas garantias têm teste que tenta violá-las com SQL direto ([schema-constraints.test.ts](test/integration/schema-constraints.test.ts)).
 
@@ -248,7 +299,7 @@ PENDING_REFERENCE ──► PROCESSED | REJECTED | FAILED      (scheduleReferenc
 PROCESSED, REJECTED, FAILED: terminais — transicionar é erro de programação (InvalidTransactionStateError)
 ```
 
-`PENDING` é transitório em memória: a transação nasce e é decidida na mesma transação SQL, então nunca é persistida como PENDING. `FAILED` é reservado para falha permanente de infraestrutura auditável. No fluxo atual, falhas permanentes de mensagens vão para a DLQ sem criar linha (veja Limitações).
+`PENDING` é transitório em memória: a transação nasce e é decidida na mesma transação SQL, então nunca é persistida como PENDING. `FAILED` é usado só quando um erro **inesperado** esgota as tentativas no SQS (ADR-12): a transação fica terminal, auditável e sem efeito no saldo. As demais recusas (payload inválido, conflito, wallet inexistente, transitórias) ficam na trilha `wager_submission_failures`, que não ocupa a chave de idempotência.
 
 **Interpretações adotadas** (o enunciado pede que sejam documentadas):
 1. **Reversão única no total.** A regra 4 diz "pelo mesmo tipo", mas permitir `REFUND` **e** `ROLLBACK` da mesma `BET` creditaria duas vezes. Adotamos a regra mais estrita: uma referência é revertida no máximo uma vez, por REFUND ou ROLLBACK, o que for `PROCESSED` primeiro. Para desfazer um REFUND, usa-se `ROLLBACK` *do REFUND*. ROLLBACK de ROLLBACK não é permitido.
@@ -273,6 +324,7 @@ O mesmo código para a primeira execução e para o replay. `idempotentReplay` e
 | Processada | **201** | `{transactionId, status:"PROCESSED", balance, idempotentReplay}` | seguir |
 | Aceita, aguardando referência | **202** | `status:"PENDING_REFERENCE"` | consultar depois ou ouvir eventos |
 | Rejeição de negócio (persistida) | **422** | `status:"REJECTED", failureCode` | não reenviar (ver ação na taxonomia) |
+| Falha permanente auditada (`FAILED`, só via SQS, ADR-12) | **422** | `status:"FAILED", failureCode:"INFRA_PERMANENT_FAILURE"` | não reenviar; acionar suporte |
 | Payload inválido / header ausente / `OPENING` | **400** | `code:"VALIDATION_ERROR", details.issues[]` | corrigir o payload |
 | Conflito de idempotência / wallet duplicada | **409** | `code:"IDEMPOTENCY_CONFLICT" \| "WALLET_ALREADY_EXISTS"` | não reenviar |
 | Wallet inexistente | **422** | `code:"WALLET_NOT_FOUND"` | corrigir ou criar a wallet |
@@ -294,7 +346,7 @@ O mesmo código para a primeira execução e para o replay. `idempotentReplay` e
 | `REFERENCE_KIND_NOT_ALLOWED` | corrigir | REFUND→BET; ROLLBACK→BET\|WIN\|REFUND; WIN/LOSS→BET |
 | `REFERENCE_NOT_PROCESSED` | final | referência REJECTED/FAILED |
 | `REFERENCE_ALREADY_REVERSED` | final | já existe REFUND/ROLLBACK `PROCESSED` para a referência |
-| `INFRA_PERMANENT_FAILURE` | final | reservado para `FAILED` auditável |
+| `INFRA_PERMANENT_FAILURE` | final | erro inesperado que esgotou as tentativas; transação `FAILED` auditável (ADR-12) |
 
 ### Eventos de integração
 
@@ -306,6 +358,8 @@ Todos usam a classe abstrata `IntegrationEvent<T>`, com `eventType` e `version` 
 | `WagerTransactionRejected` v1 | rejeição de negócio |
 | `WalletBalanceChanged` v1 | **somente** quando o saldo muda (traz `walletVersion`, `balanceBefore`/`After`) |
 | `WagerTransactionPendingReference` v1 | primeira vez que a transação fica pendente |
+| `WagerTransactionFailed` v1 | transação gravada como `FAILED` (ADR-12) |
+| `WagerSubmissionFailed` v1 | submissão recusada fora do fluxo de negócio (auditoria; `aggregateId` = walletId quando conhecida) |
 
 ---
 
@@ -369,7 +423,7 @@ sequenceDiagram
 
 ## 9. Estratégia de testes
 
-São 175 testes. **Nenhum mock de PostgreSQL ou SQS**: integração e concorrência rodam contra PostgreSQL 17 e MiniStack reais (`docker-compose.test.yml`). Cada suíte usa um **banco isolado**, clonado de um template migrado (`CREATE DATABASE … TEMPLATE`), e **filas com sufixo único**. O invariante final roda ao fim de todas as suítes: `assertAllWalletsConsistent` verifica saldo = Σledger, a cadeia de versões contínua e a versão final igual à da wallet.
+São 193 testes. **Nenhum mock de PostgreSQL ou SQS**: integração e concorrência rodam contra PostgreSQL 17 e MiniStack reais (`docker-compose.test.yml`). Cada suíte usa um **banco isolado**, clonado de um template migrado (`CREATE DATABASE … TEMPLATE`), e **filas com sufixo único**. O invariante final roda ao fim de todas as suítes: `assertAllWalletsConsistent` verifica saldo = Σledger, a cadeia de versões contínua e a versão final igual à da wallet.
 
 | Exigência do enunciado | Onde |
 |---|---|
@@ -388,6 +442,7 @@ São 175 testes. **Nenhum mock de PostgreSQL ou SQS**: integração e concorrên
 | 6. dois publishers na mesma outbox | `multi-instance.test.ts` #6 (um morre após publicar e antes de marcar) |
 | 7. ROLLBACK/REFUND antes da referência | `outbox-and-references.test.ts` (+ orçamento esgotado e 3 workers concorrentes) |
 | 8. reinício com prova de consistência | `multi-instance.test.ts` #8 (SIGKILL em todas as instâncias no meio do tráfego e restart) |
+| Auditoria e `FAILED` (ADR-12) | `submission-failures.test.ts` (HTTP: payload inválido, conflito, wallet inexistente, reenvio corrigido; SQS: erro inesperado esgotado → `FAILED`, poison message; imutabilidade), `sqs-consumer.test.ts` (transitória esgotada → `RETRIES_EXHAUSTED`, sem `FAILED`) |
 
 Ferramentas de suporte:
 - `FaultInjector`: pontos de crash só para teste, ignorados em produção;
@@ -398,7 +453,8 @@ Ferramentas de suporte:
 
 ## 10. Limitações conhecidas e próximos passos
 
-- **Status `FAILED`.** Falhas permanentes de mensagens vão para a DLQ com o motivo, mas não geram linha `FAILED` em `wager_transactions`, porque a transação SQL foi revertida. Próximo passo: persistir o `FAILED` auditável em transação separada antes do dead-letter, quando a identidade da transação for válida.
+- **Reprocessar um `FAILED`.** Depois de corrigido o defeito, uma transação `FAILED` continua terminal. Reprocessá-la exige uma ferramenta operacional explícita (nova chave, ou anulação auditada do `FAILED`), que não foi implementada.
+- **Auditoria sem limite de taxa.** Um cliente que envia lixo em volume gera uma linha por requisição. A mitigação é rate limiting no gateway e a retenção de 90 dias.
 - **Contexto de trace na outbox.** O trace da requisição original não é gravado na outbox, então o span de publicação começa um trace novo. Próximo passo: adicionar uma coluna `traceparent`.
 - **Ordem entre publishers** é *best effort*. Os consumidores devem usar `walletVersion` e deduplicar por `eventId`.
 - **Testes de multi-processo e timing.** Uma execução isolada falhou no cenário #5 por mensagem residual de outro cenário. A causa foi corrigida com filas dedicadas, e depois disso foram 10 execuções seguidas sem falha. Como os testes dependem de tempo, um ambiente muito saturado pode aumentar a latência; os timeouts são generosos.

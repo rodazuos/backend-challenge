@@ -220,7 +220,14 @@ describe("SQS consumer", () => {
         { what: "message redriven to DLQ", timeoutMs: 40_000, intervalMs: 500 },
       );
       expect(dead).toBeDefined();
+      // Transient exhaustion stays recoverable: audited as retryable, never frozen as FAILED.
       expect(await txByExternal(msg.data.externalTransactionId)).toHaveLength(0);
+      expect(dead?.MessageAttributes?.failureReason?.StringValue).toBe("RETRIES_EXHAUSTED");
+      const audit = await db.query<{ reason_code: string; retryable: boolean; receive_count: number }>(
+        "SELECT reason_code, retryable, receive_count FROM wager_submission_failures WHERE message_id = $1",
+        [msg.messageId],
+      );
+      expect(audit).toEqual([{ reason_code: "RETRIES_EXHAUSTED", retryable: true, receive_count: 3 }]);
     } finally {
       await blocker.query("ROLLBACK");
       await blocker.end();

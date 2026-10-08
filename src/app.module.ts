@@ -10,6 +10,10 @@ import {
   type ProviderIdentityPort,
 } from "./modules/auth/provider-auth";
 import { ProcessWagerTransaction } from "./modules/wagering/application/process-wager-transaction";
+import {
+  ListSubmissionFailures,
+  RecordSubmissionFailure,
+} from "./modules/wagering/application/submission-failures";
 import { GetWagerTransaction } from "./modules/wagering/application/wager-queries";
 import { WageringController } from "./modules/wagering/infrastructure/http/wagering.controller";
 import {
@@ -41,6 +45,8 @@ export class AppModule {
       providers: [
         { provide: ProcessWagerTransaction, useValue: core.processWager },
         { provide: GetWagerTransaction, useValue: core.getWager },
+        { provide: RecordSubmissionFailure, useValue: core.recordSubmissionFailure },
+        { provide: ListSubmissionFailures, useValue: core.listSubmissionFailures },
         { provide: CreateWallet, useValue: core.createWallet },
         { provide: GetWallet, useValue: core.getWallet },
         { provide: ListWalletLedger, useValue: core.listLedger },

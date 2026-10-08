@@ -26,6 +26,7 @@ export interface AppMetrics {
   outboxPublishFailure(): void;
   reconciliation(consistent: boolean): void;
   pendingReferenceResolution(outcome: string): void;
+  submissionFailure(channel: Channel, reason: string): void;
 }
 
 export const APP_METRICS = Symbol("APP_METRICS");
@@ -43,6 +44,7 @@ export const noopMetrics: AppMetrics = {
   outboxPublishFailure: () => {},
   reconciliation: () => {},
   pendingReferenceResolution: () => {},
+  submissionFailure: () => {},
 };
 
 /** Diagnostic context propagated through async calls and injected into every log line. */

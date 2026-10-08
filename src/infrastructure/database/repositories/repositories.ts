@@ -9,8 +9,14 @@ import type { InboxMessage } from "../../../modules/messaging/domain/inbox-messa
 import type { OutboxMessage } from "../../../modules/messaging/domain/outbox-message";
 import type {
   ClaimedPendingReference,
+  SubmissionFailureRepository,
   WagerTransactionRepository,
 } from "../../../modules/wagering/application/wagering-ports";
+import {
+  type SubmissionChannel,
+  SubmissionFailure,
+  type SubmissionFailureCategory,
+} from "../../../modules/wagering/domain/submission-failure";
 import type { WagerTransaction } from "../../../modules/wagering/domain/wager-transaction";
 import type {
   LedgerAggregate,
@@ -28,6 +34,7 @@ import {
   LedgerEntryRecord,
   LedgerPostingRecord,
   OutboxMessageRecord,
+  SubmissionFailureRecord,
   WagerTransactionRecord,
   WalletRecord,
 } from "../entities";
@@ -395,5 +402,71 @@ export class MikroOutboxRepository implements OutboxRepository {
       pending: Number.parseInt(row?.pending ?? "0", 10),
       oldestPendingOccurredAt: row?.oldest ? toDate(row.oldest) : undefined,
     };
+  }
+}
+
+const optional = <T>(v: T | null | undefined): T | undefined => (v === null ? undefined : v);
+
+export class MikroSubmissionFailureRepository implements SubmissionFailureRepository {
+  constructor(private readonly em: EntityManager) {}
+
+  async insert(failure: SubmissionFailure): Promise<void> {
+    const s = failure.toState();
+    await this.em.insert(SubmissionFailureRecord, {
+      id: s.id,
+      channel: s.channel,
+      reasonCode: s.reasonCode,
+      category: s.category,
+      retryable: s.retryable,
+      providerId: s.providerId ?? null,
+      externalTransactionId: s.externalTransactionId ?? null,
+      idempotencyKey: s.idempotencyKey ?? null,
+      walletId: s.walletId ?? null,
+      messageId: s.messageId ?? null,
+      transactionId: s.transactionId ?? null,
+      payloadHash: s.payloadHash ?? null,
+      detail: s.detail ?? null,
+      receiveCount: s.receiveCount ?? null,
+      correlationId: s.correlationId ?? null,
+      occurredAt: s.occurredAt,
+    });
+  }
+
+  async listByExternalId(providerId: string, externalTransactionId: string, limit: number) {
+    const rows = await this.em.find(
+      SubmissionFailureRecord,
+      { providerId, externalTransactionId },
+      { orderBy: { occurredAt: "desc" }, limit, disableIdentityMap: true },
+    );
+    return rows.map((r) =>
+      SubmissionFailure.rehydrate({
+        id: r.id,
+        channel: r.channel as SubmissionChannel,
+        reasonCode: r.reasonCode,
+        category: r.category as SubmissionFailureCategory,
+        retryable: r.retryable,
+        providerId: optional(r.providerId),
+        externalTransactionId: optional(r.externalTransactionId),
+        idempotencyKey: optional(r.idempotencyKey),
+        walletId: optional(r.walletId),
+        messageId: optional(r.messageId),
+        transactionId: optional(r.transactionId),
+        payloadHash: optional(r.payloadHash),
+        detail: optional(r.detail),
+        receiveCount: optional(r.receiveCount),
+        correlationId: optional(r.correlationId),
+        occurredAt: toDate(r.occurredAt),
+      }),
+    );
+  }
+
+  async purgeOccurredBefore(cutoff: Date, limit: number): Promise<number> {
+    const rows = await this.em.execute<{ id: string }[]>(
+      `DELETE FROM wager_submission_failures
+        WHERE id IN (SELECT id FROM wager_submission_failures WHERE occurred_at < ? LIMIT ?)
+      RETURNING id`,
+      [cutoff, limit],
+    );
+    return rows.length;
   }
 }

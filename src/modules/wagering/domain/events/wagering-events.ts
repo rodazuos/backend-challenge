@@ -4,6 +4,7 @@ import type { LedgerDirection } from "../../../wallet/domain/ledger-direction";
 import type { Wallet } from "../../../wallet/domain/wallet";
 import type { WalletLedgerEntry } from "../../../wallet/domain/wallet-ledger-entry";
 import type { FailureCode } from "../failure-code";
+import type { SubmissionChannel, SubmissionFailure, SubmissionFailureCategory } from "../submission-failure";
 import type { WagerTransaction } from "../wager-transaction";
 
 /*
@@ -148,5 +149,74 @@ export class WalletBalanceChanged extends IntegrationEvent<WalletBalanceChangedD
         walletVersion: entry.walletVersion,
       },
     });
+  }
+}
+
+export interface WagerTransactionFailedData extends WagerTransactionRef {
+  status: "FAILED";
+  failureCode: FailureCode;
+  failedAt: string;
+}
+
+/** A transaction that hit a permanent infrastructure failure (kept FAILED for audit; no balance effect). */
+export class WagerTransactionFailed extends IntegrationEvent<WagerTransactionFailedData> {
+  readonly eventType = "WagerTransactionFailed";
+  readonly version = 1;
+
+  static from(tx: WagerTransaction, ctx: EventContext): WagerTransactionFailed {
+    return new WagerTransactionFailed({
+      ...ctx,
+      aggregateId: tx.walletId,
+      data: {
+        ...transactionRef(tx),
+        status: "FAILED",
+        failureCode: requireDefined(tx.failureCode, "failureCode"),
+        failedAt: requireDefined(tx.processedAt, "processedAt").toISOString(),
+      },
+    });
+  }
+}
+
+export interface WagerSubmissionFailedData {
+  failureId: string;
+  channel: SubmissionChannel;
+  reasonCode: string;
+  category: SubmissionFailureCategory;
+  retryable: boolean;
+  providerId?: string;
+  externalTransactionId?: string;
+  idempotencyKey?: string;
+  walletId?: string;
+  messageId?: string;
+  transactionId?: string;
+}
+
+/**
+ * A submission that did not become a business outcome (see SubmissionFailure). Lets asynchronous (SQS) providers
+ * learn about rejections they never get a response for. aggregateId = walletId when known, else the failure id.
+ */
+export class WagerSubmissionFailed extends IntegrationEvent<WagerSubmissionFailedData> {
+  readonly eventType = "WagerSubmissionFailed";
+  readonly version = 1;
+
+  static from(failure: SubmissionFailure, ctx: EventContext): WagerSubmissionFailed {
+    const data: WagerSubmissionFailedData = {
+      failureId: failure.id,
+      channel: failure.channel,
+      reasonCode: failure.reasonCode,
+      category: failure.category,
+      retryable: failure.retryable,
+    };
+    const optional = {
+      providerId: failure.providerId,
+      externalTransactionId: failure.externalTransactionId,
+      idempotencyKey: failure.idempotencyKey,
+      walletId: failure.walletId,
+      messageId: failure.messageId,
+      transactionId: failure.transactionId,
+    };
+    for (const [k, v] of Object.entries(optional))
+      if (v !== undefined) (data as unknown as Record<string, string>)[k] = v;
+    return new WagerSubmissionFailed({ ...ctx, aggregateId: failure.walletId ?? failure.id, data });
   }
 }

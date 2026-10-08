@@ -1,7 +1,17 @@
 import type { Message } from "@aws-sdk/client-sqs";
-import type { ProcessWagerTransaction } from "../../modules/wagering/application/process-wager-transaction";
+import type {
+  ProcessWagerTransaction,
+  SubmitWagerCommand,
+} from "../../modules/wagering/application/process-wager-transaction";
+import {
+  classifySubmissionError,
+  type FailureClassification,
+  type RecordSubmissionFailure,
+} from "../../modules/wagering/application/submission-failures";
+import { FailureCode } from "../../modules/wagering/domain/failure-code";
+import { SubmissionFailureCategory } from "../../modules/wagering/domain/submission-failure";
 import type { ExternalWagerKind } from "../../modules/wagering/domain/wager-transaction-kind";
-import { type WagerMessage, WagerMessageContract } from "../../modules/wagering/infrastructure/contracts";
+import { WagerMessageContract } from "../../modules/wagering/infrastructure/contracts";
 import { ApplicationError } from "../../shared/application/errors";
 import { type AppLogger, type AppMetrics, logContext } from "../../shared/application/observability";
 import { computeBackoffMs } from "../../shared/domain/backoff";
@@ -29,9 +39,12 @@ type Decision =
  * Consumes `wager-transactions.fifo` and delegates to the same use case as HTTP.
  *
  *  - business outcome (PROCESSED/REJECTED/PENDING_REFERENCE) → committed → ack (delete)
- *  - transient failure (DB/lock/connection) → visibility backoff; after maxReceiveCount the redrive policy moves
- *    the message to the DLQ
- *  - permanent failure (malformed message, idempotency conflict, unknown wallet) → explicit DLQ + delete
+ *  - transient failure (DB/lock/connection) → visibility backoff; on the last allowed attempt it is audited
+ *    (RETRIES_EXHAUSTED, still recoverable) and dead-lettered
+ *  - unexpected error on the last attempt → transaction recorded as FAILED (auditable, terminal), audited, DLQ
+ *  - permanent failure (malformed message, idempotency conflict, unknown wallet) → audited + explicit DLQ + delete
+ * Every dead-lettered message leaves an audit row (wager_submission_failures) and a WagerSubmissionFailed event;
+ * the redrive policy (maxReceiveCount) remains as a safety net for messages that crash the consumer itself.
  *
  * Ack happens strictly after the SQL commit. A crash between commit and ack causes a redelivery, which the
  * persistent inbox recognises (no second effect). Messages of the same MessageGroupId (wallet) inside a batch
@@ -47,6 +60,7 @@ export class SqsWagerConsumer {
   constructor(
     private readonly sqs: SqsGateway,
     private readonly processWager: ProcessWagerTransaction,
+    private readonly recordFailure: RecordSubmissionFailure,
     private readonly settings: ConsumerSettings,
     private readonly metrics: AppMetrics,
     private readonly logger: AppLogger,
@@ -133,7 +147,7 @@ export class SqsWagerConsumer {
           const heartbeat = this.startHeartbeat(message);
           let decision: Decision;
           try {
-            decision = await this.decide(message);
+            decision = await this.decide(message, receiveCount);
           } finally {
             clearInterval(heartbeat);
           }
@@ -146,20 +160,29 @@ export class SqsWagerConsumer {
     );
   }
 
-  private async decide(message: Message): Promise<Decision> {
-    let parsed: WagerMessage;
+  private async decide(message: Message, receiveCount: number): Promise<Decision> {
+    let raw: unknown;
     try {
-      const json: unknown = JSON.parse(message.Body ?? "");
-      const result = WagerMessageContract.safeParse(json);
-      if (!result.success) {
-        const detail = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
-        return { kind: "dlq", reason: "INVALID_MESSAGE", detail };
-      }
-      parsed = result.data;
+      raw = JSON.parse(message.Body ?? "");
     } catch {
-      return { kind: "dlq", reason: "INVALID_JSON", detail: "body is not valid JSON" };
+      return this.deadLetter(message, undefined, receiveCount, {
+        reasonCode: "INVALID_JSON",
+        category: SubmissionFailureCategory.Validation,
+        retryable: false,
+        detail: "body is not valid JSON",
+      });
     }
-
+    const result = WagerMessageContract.safeParse(raw);
+    if (!result.success) {
+      const detail = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
+      return this.deadLetter(message, raw, receiveCount, {
+        reasonCode: "INVALID_MESSAGE",
+        category: SubmissionFailureCategory.Validation,
+        retryable: false,
+        detail,
+      });
+    }
+    const parsed = result.data;
     const { data } = parsed;
     logContext.assign({
       messageId: parsed.messageId,
@@ -167,33 +190,90 @@ export class SqsWagerConsumer {
       providerId: data.providerId,
       walletId: data.walletId,
     });
+    const { idempotencyKey, ...payload } = data;
+    const command: SubmitWagerCommand = {
+      ...payload,
+      kind: payload.kind as ExternalWagerKind,
+      idempotencyKey,
+      channel: "sqs",
+      correlationId: logContext.get().correlationId ?? parsed.messageId,
+      causationId: parsed.messageId,
+      inbox: {
+        consumerName: this.settings.consumerName,
+        // The envelope's business content; the same messageId with a different body is a conflict.
+        messageId: parsed.messageId,
+        payloadHash: `v1:${sha256Hex(canonicalJson(data as unknown as Json))}`,
+      },
+    };
+
     try {
-      const { idempotencyKey, ...payload } = data;
-      const result = await this.processWager.execute({
-        ...payload,
-        kind: payload.kind as ExternalWagerKind,
-        idempotencyKey,
-        channel: "sqs",
-        correlationId: logContext.get().correlationId ?? parsed.messageId,
-        causationId: parsed.messageId,
-        inbox: {
-          consumerName: this.settings.consumerName,
-          // The envelope's business content; the same messageId with a different body is a conflict.
-          messageId: parsed.messageId,
-          payloadHash: `v1:${sha256Hex(canonicalJson(data as unknown as Json))}`,
-        },
-      });
+      this.faults.throwIf("consumer-unexpected-error");
+      const outcome = await this.processWager.execute(command);
       // Committed. A crash right here is the "died after commit, before ack" scenario.
       await this.faults.hit("after-commit-before-ack");
-      return { kind: "ack", duplicate: result.duplicateMessage };
+      return { kind: "ack", duplicate: outcome.duplicateMessage };
     } catch (error) {
       if (error instanceof ApplicationError && error.kind !== "TRANSIENT") {
-        return { kind: "dlq", reason: error.code, detail: error.message };
+        // Permanent by nature (malformed, conflict, unknown wallet): audit and dead-letter now.
+        return this.deadLetter(message, parsed, receiveCount, classifySubmissionError(error));
       }
-      const reason = error instanceof ApplicationError ? error.code : "UNEXPECTED_ERROR";
-      this.logger.warn({ err: error, reason }, "wager message failed transiently");
-      return { kind: "retry", reason };
+      const unexpected = !(error instanceof ApplicationError);
+      const reason = unexpected ? "UNEXPECTED_ERROR" : (error as ApplicationError).code;
+      if (receiveCount < this.settings.maxReceiveCount) {
+        this.logger.warn({ err: error, reason, receiveCount }, "wager message failed; will be retried");
+        return { kind: "retry", reason };
+      }
+      // Last attempt. Transient failures stay recoverable (DLQ redrive / provider resend). An unexpected error
+      // that survived every retry is a defect: freeze the submission as FAILED so the provider gets a definitive,
+      // auditable answer instead of silence.
+      let transactionId: string | undefined;
+      if (unexpected) {
+        const failed = await this.processWager
+          .markFailed(command, FailureCode.InfraPermanentFailure)
+          .catch((e) => this.logger.error({ err: e }, "could not mark transaction FAILED"));
+        transactionId = failed?.transactionId;
+      }
+      return this.deadLetter(
+        message,
+        parsed,
+        receiveCount,
+        {
+          reasonCode: unexpected ? "UNEXPECTED_ERROR" : "RETRIES_EXHAUSTED",
+          category: SubmissionFailureCategory.Infrastructure,
+          retryable: !unexpected,
+          detail: `${reason} after ${receiveCount} attempts: ${error instanceof Error ? error.message : String(error)}`,
+        },
+        transactionId,
+      );
     }
+  }
+
+  /** Audits the failure (and its WagerSubmissionFailed event), then dead-letters the message. */
+  private async deadLetter(
+    message: Message,
+    content: unknown,
+    receiveCount: number,
+    classification: FailureClassification,
+    transactionId?: string,
+  ): Promise<Decision> {
+    const envelope = (content && typeof content === "object" ? content : {}) as Record<string, unknown>;
+    const data = (envelope.data && typeof envelope.data === "object" ? envelope.data : {}) as Record<
+      string,
+      unknown
+    >;
+    const str = (v: unknown) => (typeof v === "string" ? v : undefined);
+    await this.recordFailure.execute({
+      channel: "sqs",
+      ...classification,
+      providerId: str(data.providerId),
+      externalTransactionId: str(data.externalTransactionId),
+      idempotencyKey: str(data.idempotencyKey),
+      walletId: str(data.walletId),
+      messageId: str(envelope.messageId) ?? message.MessageId,
+      transactionId,
+      receiveCount,
+    });
+    return { kind: "dlq", reason: classification.reasonCode, detail: classification.detail };
   }
 
   private async apply(message: Message, decision: Decision, receiveCount: number): Promise<void> {
@@ -221,7 +301,7 @@ export class SqsWagerConsumer {
             jitter: 0.3,
           });
           await this.sqs.changeVisibility(handle, delay / 1000);
-          this.metrics.sqsMessage(receiveCount >= this.settings.maxReceiveCount ? "dlq" : "retry");
+          this.metrics.sqsMessage("retry");
           this.logger.warn(
             {
               reason: decision.reason,
@@ -229,9 +309,7 @@ export class SqsWagerConsumer {
               retryInMs: delay,
               maxReceiveCount: this.settings.maxReceiveCount,
             },
-            receiveCount >= this.settings.maxReceiveCount
-              ? "retry budget exhausted; redrive policy will dead-letter the message"
-              : "message will be retried",
+            "message will be retried",
           );
           return;
         }

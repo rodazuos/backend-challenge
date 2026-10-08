@@ -86,6 +86,12 @@ export class PromMetrics implements AppMetrics {
     help: "Wallets whose stored balance diverged from the ledger",
     registers: [this.registry],
   });
+  private readonly submissionFailures = new Counter({
+    name: "wager_submission_failures_total",
+    help: "Submissions that did not become a business outcome (audited), by channel and reason",
+    labelNames: ["channel", "reason"],
+    registers: [this.registry],
+  });
   private readonly pendingRefResolutions = new Counter({
     name: "pending_reference_resolutions_total",
     help: "PENDING_REFERENCE re-evaluations by outcome",
@@ -190,5 +196,8 @@ export class PromMetrics implements AppMetrics {
   }
   pendingReferenceResolution(outcome: string) {
     this.pendingRefResolutions.inc({ outcome });
+  }
+  submissionFailure(channel: Channel, reason: string) {
+    this.submissionFailures.inc({ channel, reason });
   }
 }
