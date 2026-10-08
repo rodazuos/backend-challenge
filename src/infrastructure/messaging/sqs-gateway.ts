@@ -11,6 +11,8 @@ import {
   SQSClient,
 } from "@aws-sdk/client-sqs";
 
+import { injectTraceContext } from "../observability/tracing";
+
 export interface SqsSettings {
   region: string;
   endpoint?: string | undefined;
@@ -103,9 +105,13 @@ export class SqsGateway {
         MessageBody: body,
         MessageGroupId: groupId,
         MessageDeduplicationId: deduplicationId,
-        MessageAttributes: correlationId
-          ? { correlationId: { DataType: "String", StringValue: correlationId } }
-          : undefined,
+        MessageAttributes: {
+          ...(correlationId ? { correlationId: { DataType: "String", StringValue: correlationId } } : {}),
+          // W3C trace context, so the consumer span continues the producer's trace.
+          ...Object.fromEntries(
+            Object.entries(injectTraceContext()).map(([k, v]) => [k, { DataType: "String", StringValue: v }]),
+          ),
+        },
       }),
     );
   }

@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Distributed wagering processor — Jungle Gaming backend challenge",
   "scripts": {
-    "start": "bun run src/main.ts",
+    "start": "bun --preload ./src/infrastructure/observability/tracing.ts src/main.ts",
     "dev": "bun --watch src/main.ts",
     "migrate:up": "bun run src/infrastructure/database/migrate.ts up",
     "migrate:down": "bun run src/infrastructure/database/migrate.ts down",

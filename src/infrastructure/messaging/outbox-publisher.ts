@@ -2,6 +2,7 @@ import type { OutboxMessage } from "../../modules/messaging/domain/outbox-messag
 import type { AppLogger, AppMetrics } from "../../shared/application/observability";
 import type { UnitOfWork } from "../../shared/application/unit-of-work";
 import type { Clock } from "../../shared/domain/ports";
+import { withSpan } from "../observability/tracing";
 import type { FaultInjector } from "../workers/fault-injector";
 import { PollingWorker } from "../workers/polling-worker";
 import type { OutgoingEvent, SqsGateway } from "./sqs-gateway";
@@ -54,6 +55,15 @@ export class OutboxPublisher extends PollingWorker {
       { label: "outbox-claim" },
     );
     if (claimed.length === 0) return 0;
+    // Span only for non-empty cycles: idle polling would otherwise flood the tracing backend.
+    return withSpan(
+      "outbox publish",
+      { "outbox.owner": this.settings.owner, "outbox.claimed": claimed.length },
+      () => this.publishClaimed(claimed),
+    );
+  }
+
+  private async publishClaimed(claimed: OutboxMessage[]): Promise<number> {
     await this.faults.hit("after-claim-before-publish");
 
     const failed = new Map<string, string>();

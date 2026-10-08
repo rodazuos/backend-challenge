@@ -1,6 +1,7 @@
 import type { LoggerService } from "@nestjs/common";
 import pino from "pino";
 import { logContext } from "../../shared/application/observability";
+import { currentTraceId } from "./tracing";
 
 /**
  * Structured JSON logs. Every line carries the async context (correlationId, messageId, transactionId,
@@ -13,7 +14,7 @@ export function createLogger(opts: { level: string; service: string; instanceId:
     base: { service: opts.service, instance: opts.instanceId },
     timestamp: pino.stdTimeFunctions.isoTime,
     formatters: { level: (label) => ({ level: label }) },
-    mixin: () => ({ ...logContext.get() }),
+    mixin: () => ({ ...logContext.get(), traceId: currentTraceId() }),
     serializers: { err: pino.stdSerializers.err, error: pino.stdSerializers.err },
     redact: {
       paths: [

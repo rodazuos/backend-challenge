@@ -6,6 +6,7 @@ import { ApplicationError } from "../../shared/application/errors";
 import { type AppLogger, type AppMetrics, logContext } from "../../shared/application/observability";
 import { computeBackoffMs } from "../../shared/domain/backoff";
 import { canonicalJson, type Json, sha256Hex } from "../../shared/domain/canonical-json";
+import { extractTraceContext, SpanKind, withSpan } from "../observability/tracing";
 import type { FaultInjector } from "../workers/fault-injector";
 import type { SqsGateway } from "./sqs-gateway";
 
@@ -117,16 +118,32 @@ export class SqsWagerConsumer {
   private async handle(message: Message): Promise<void> {
     const receiveCount = Number(message.Attributes?.ApproximateReceiveCount ?? 1);
     const correlationId = message.MessageAttributes?.correlationId?.StringValue;
-    await logContext.run({ messageId: message.MessageId, correlationId, channel: "sqs" }, async () => {
-      const heartbeat = this.startHeartbeat(message);
-      let decision: Decision;
-      try {
-        decision = await this.decide(message);
-      } finally {
-        clearInterval(heartbeat);
-      }
-      await this.apply(message, decision, receiveCount);
-    });
+    const carrier = Object.fromEntries(
+      Object.entries(message.MessageAttributes ?? {}).map(([k, v]) => [k, v.StringValue]),
+    );
+    await logContext.run({ messageId: message.MessageId, correlationId, channel: "sqs" }, () =>
+      withSpan(
+        "wager-transactions process",
+        {
+          "messaging.system": "aws_sqs",
+          "messaging.message.id": message.MessageId,
+          "messaging.receive_count": receiveCount,
+        },
+        async (span) => {
+          const heartbeat = this.startHeartbeat(message);
+          let decision: Decision;
+          try {
+            decision = await this.decide(message);
+          } finally {
+            clearInterval(heartbeat);
+          }
+          span.setAttribute("wagering.decision", decision.kind);
+          await this.apply(message, decision, receiveCount);
+        },
+        SpanKind.CONSUMER,
+        extractTraceContext(carrier),
+      ),
+    );
   }
 
   private async decide(message: Message): Promise<Decision> {

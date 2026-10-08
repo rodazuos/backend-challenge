@@ -34,14 +34,12 @@ export class HttpErrorFilter implements ExceptionFilter {
       if (exception.kind === "TRANSIENT") res.setHeader("Retry-After", "1");
       const level = exception.kind === "TRANSIENT" || exception.kind === "CONFLICT" ? "warn" : "info";
       this.logger[level]({ code: exception.code, status }, exception.message);
-      res
-        .status(status)
-        .json({
-          code: exception.code,
-          message: exception.message,
-          details: exception.details,
-          correlationId,
-        });
+      res.status(status).json({
+        code: exception.code,
+        message: exception.message,
+        details: exception.details,
+        correlationId,
+      });
       return;
     }
 
