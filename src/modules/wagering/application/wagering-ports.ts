@@ -1,6 +1,11 @@
 import type { SubmissionFailure } from "../domain/submission-failure";
 import type { WagerTransaction } from "../domain/wager-transaction";
 
+export interface ExternalRef {
+  providerId: string;
+  externalTransactionId: string;
+}
+
 export interface ClaimedPendingReference {
   id: string;
   walletId: string;
@@ -21,7 +26,18 @@ export interface WagerTransactionRepository {
   ): Promise<WagerTransaction | undefined>;
   /** Row lock on the transaction; callers must already hold the wallet lock (lock ordering: wallet → transaction). */
   lockById(id: string): Promise<WagerTransaction | undefined>;
-  insert(tx: WagerTransaction): Promise<void>;
+  /** Multi-row insert (a unique violation on an idempotency constraint surfaces as a retryable race). */
+  insertMany(txs: readonly WagerTransaction[]): Promise<void>;
+  /** One query for every idempotency key and every (provider, external id) of a batch. */
+  findIdempotencyCandidatesMany(
+    keys: readonly string[],
+    pairs: readonly ExternalRef[],
+  ): Promise<WagerTransaction[]>;
+  findByProviderExternalIds(pairs: readonly ExternalRef[]): Promise<WagerTransaction[]>;
+  /** Ids among `transactionIds` that already have a PROCESSED REFUND/ROLLBACK. */
+  reversedAmong(transactionIds: readonly string[]): Promise<Set<string>>;
+  /** Batch version of nudgeDependents (same wallet only). */
+  nudgeDependentsMany(walletId: string, references: readonly ExternalRef[], now: Date): Promise<number>;
   /** Persists the mutable lifecycle columns (status, outcome, retry bookkeeping). */
   update(tx: WagerTransaction): Promise<void>;
   /** True when a PROCESSED REFUND/ROLLBACK already references `transactionId`. */

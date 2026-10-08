@@ -9,6 +9,7 @@ import type { InboxMessage } from "../../../modules/messaging/domain/inbox-messa
 import type { OutboxMessage } from "../../../modules/messaging/domain/outbox-message";
 import type {
   ClaimedPendingReference,
+  ExternalRef,
   SubmissionFailureRepository,
   WagerTransactionRepository,
 } from "../../../modules/wagering/application/wagering-ports";
@@ -145,15 +146,76 @@ export class MikroWagerTransactionRepository implements WagerTransactionReposito
     return row ? wagerMapper.toDomain(row) : undefined;
   }
 
-  async insert(tx: WagerTransaction): Promise<void> {
+  async insertMany(txs: readonly WagerTransaction[]): Promise<void> {
+    if (txs.length === 0) return;
     try {
-      await this.em.insert(WagerTransactionRecord, wagerMapper.toRecord(tx));
+      await this.em.insertMany(WagerTransactionRecord, txs.map(wagerMapper.toRecord));
     } catch (error) {
       if (IDEMPOTENCY_CONSTRAINTS.some((c) => isUniqueViolation(error, c))) {
-        throw new IdempotencyRaceError(`concurrent duplicate for ${tx.idempotencyKey}`, { cause: error });
+        throw new IdempotencyRaceError(`concurrent duplicate among ${txs.length} transaction(s)`, {
+          cause: error,
+        });
       }
       throw error;
     }
+  }
+
+  async findIdempotencyCandidatesMany(keys: readonly string[], pairs: readonly ExternalRef[]) {
+    if (keys.length === 0 && pairs.length === 0) return [];
+    const rows = await this.em.find(
+      WagerTransactionRecord,
+      {
+        $or: [
+          ...(keys.length > 0 ? [{ idempotencyKey: { $in: [...keys] } }] : []),
+          ...pairs.map((p) => ({ providerId: p.providerId, externalTransactionId: p.externalTransactionId })),
+        ],
+      },
+      { disableIdentityMap: true },
+    );
+    return rows.map(wagerMapper.toDomain);
+  }
+
+  async findByProviderExternalIds(pairs: readonly ExternalRef[]) {
+    if (pairs.length === 0) return [];
+    const rows = await this.em.find(
+      WagerTransactionRecord,
+      {
+        $or: pairs.map((p) => ({ providerId: p.providerId, externalTransactionId: p.externalTransactionId })),
+      },
+      { disableIdentityMap: true },
+    );
+    return rows.map(wagerMapper.toDomain);
+  }
+
+  async reversedAmong(transactionIds: readonly string[]): Promise<Set<string>> {
+    if (transactionIds.length === 0) return new Set();
+    const rows = await this.em.find(
+      WagerTransactionRecord,
+      {
+        referenceTransactionId: { $in: [...transactionIds] },
+        kind: { $in: ["REFUND", "ROLLBACK"] },
+        status: "PROCESSED",
+      },
+      { fields: ["referenceTransactionId"], disableIdentityMap: true },
+    );
+    return new Set(rows.map((r) => r.referenceTransactionId).filter((id): id is string => !!id));
+  }
+
+  async nudgeDependentsMany(walletId: string, references: readonly ExternalRef[], now: Date) {
+    if (references.length === 0) return 0;
+    return this.em.nativeUpdate(
+      WagerTransactionRecord,
+      {
+        walletId,
+        status: "PENDING_REFERENCE",
+        nextReferenceRetryAt: { $gt: now },
+        $or: references.map((r) => ({
+          providerId: r.providerId,
+          referenceExternalTransactionId: r.externalTransactionId,
+        })),
+      },
+      { nextReferenceRetryAt: now },
+    );
   }
 
   async update(tx: WagerTransaction): Promise<void> {
@@ -227,19 +289,29 @@ export class MikroWagerTransactionRepository implements WagerTransactionReposito
 export class MikroLedgerRepository implements LedgerRepository {
   constructor(private readonly em: EntityManager) {}
 
-  async insert(entry: WalletLedgerEntry, counterpartyAccount: string): Promise<void> {
-    await this.em.insert(LedgerEntryRecord, ledgerMapper.toRecord(entry));
+  async insertMany(
+    entries: readonly { entry: WalletLedgerEntry; counterpartyAccount: string }[],
+  ): Promise<void> {
+    if (entries.length === 0) return;
+    // One multi-row statement, in version order: the chain trigger (BEFORE INSERT, per row) sees the rows inserted
+    // earlier by the same statement, so v(n) is validated against v(n-1) exactly as with separate inserts.
+    await this.em.insertMany(
+      LedgerEntryRecord,
+      entries.map(({ entry }) => ledgerMapper.toRecord(entry)),
+    );
     await this.em.insertMany(
       LedgerPostingRecord,
-      postingsFor(entry, counterpartyAccount).map((p) => ({
-        id: Bun.randomUUIDv7(),
-        transactionId: entry.transactionId,
-        account: p.account,
-        direction: p.direction,
-        amount: p.money.toString(),
-        currency: p.money.currency,
-        createdAt: entry.createdAt,
-      })),
+      entries.flatMap(({ entry, counterpartyAccount }) =>
+        postingsFor(entry, counterpartyAccount).map((p) => ({
+          id: Bun.randomUUIDv7(),
+          transactionId: entry.transactionId,
+          account: p.account,
+          direction: p.direction,
+          amount: p.money.toString(),
+          currency: p.money.currency,
+          createdAt: entry.createdAt,
+        })),
+      ),
     );
   }
 
@@ -294,30 +366,37 @@ export class MikroLedgerRepository implements LedgerRepository {
 export class MikroInboxRepository implements InboxRepository {
   constructor(private readonly em: EntityManager) {}
 
-  async tryInsert(message: InboxMessage): Promise<boolean> {
+  async tryInsertMany(messages: readonly InboxMessage[]): Promise<Set<string>> {
+    if (messages.length === 0) return new Set();
     const rows = await this.em.execute<{ message_id: string }[]>(
       `INSERT INTO inbox_messages (consumer_name, message_id, payload_hash, received_at, processed_at)
-       VALUES (?, ?, ?, ?, ?)
+       VALUES ${messages.map(() => "(?, ?, ?, ?, ?)").join(", ")}
        ON CONFLICT (consumer_name, message_id) DO NOTHING
        RETURNING message_id`,
-      [
-        message.consumerName,
-        message.messageId,
-        message.payloadHash,
-        message.receivedAt,
-        message.processedAt ?? null,
-      ],
+      messages.flatMap((m) => [
+        m.consumerName,
+        m.messageId,
+        m.payloadHash,
+        m.receivedAt,
+        m.processedAt ?? null,
+      ]),
     );
-    return rows.length === 1;
+    return new Set(rows.map((r) => r.message_id));
   }
 
-  async find(consumerName: string, messageId: string): Promise<InboxMessage | undefined> {
-    const row = await this.em.findOne(
+  async findMany(consumerName: string, messageIds: readonly string[]): Promise<InboxMessage[]> {
+    if (messageIds.length === 0) return [];
+    const rows = await this.em.find(
       InboxMessageRecord,
-      { consumerName, messageId },
+      { consumerName, messageId: { $in: [...messageIds] } },
       { disableIdentityMap: true },
     );
-    return row ? inboxMapper.toDomain(row) : undefined;
+    return rows.map(inboxMapper.toDomain);
+  }
+
+  async deleteMany(consumerName: string, messageIds: readonly string[]): Promise<void> {
+    if (messageIds.length === 0) return;
+    await this.em.nativeDelete(InboxMessageRecord, { consumerName, messageId: { $in: [...messageIds] } });
   }
 
   async purgeReceivedBefore(cutoff: Date, limit: number): Promise<number> {

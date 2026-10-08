@@ -135,7 +135,7 @@ O Nest é só a casca HTTP/DI. O núcleo é montado sem framework em `src/compos
   - **erro inesperado** (defeito) na última tentativa: a transação vira `FAILED(INFRA_PERMANENT_FAILURE)`, é auditada e vai para a DLQ (veja o ADR-12);
   - **permanente** (JSON inválido, schema inválido, conflito de idempotência, wallet inexistente): auditoria, envio explícito à DLQ com atributo `failureReason` e delete.
 - Toda mensagem que vai para a DLQ deixa uma linha de auditoria e um evento `WagerSubmissionFailed`. A redrive policy continua como rede de segurança para mensagens que derrubam o próprio consumidor.
-- Mensagens do mesmo `MessageGroupId` (wallet) dentro de um lote são processadas **em sequência**; grupos diferentes, em paralelo. O FIFO do broker é otimização de ordem, não garantia de consistência.
+- Mensagens do mesmo `MessageGroupId` (wallet) num mesmo receive são aplicadas **em lote, numa única transação SQL e na ordem de chegada** (ADR-14), com ack em lote depois do COMMIT. Grupos diferentes rodam em paralelo. O FIFO do broker é otimização de ordem, não garantia de consistência.
 - Há um heartbeat de visibilidade para processamentos longos.
 - **`SIGTERM`:**
   1. a readiness passa a 503;
@@ -238,6 +238,48 @@ Usos legítimos existiriam: transações terminais e páginas antigas do ledger,
 
 **Decisão:** não introduzir Redis agora. Ele teria custo operacional (mais um componente e mais um modo de falha) sem ganho no caminho crítico. As alavancas reais de vazão estão na seção 8.
 
+### ADR-14 — Lote por wallet no consumidor SQS
+
+**Problema.** O teto de uma wallet é o tempo de lock: cada operação paga lock, ~10 idas ao banco e um COMMIT. Provedores costumam enviar rajadas para a **mesma** wallet (giros de slot, apostas e acertos de uma rodada). Processá-las uma a uma repete esse custo N vezes.
+
+**Decisão.** O consumidor agrupa as mensagens de cada receive por wallet e chama `ProcessWagerTransaction.executeBatch`, que aplica as N operações numa **única transação SQL**:
+1. insere o inbox de todas as mensagens (`INSERT` multi-linha `ON CONFLICT DO NOTHING RETURNING`);
+2. trava a wallet **uma vez**;
+3. busca idempotência e referências com **uma query cada** (mais uma para as já revertidas);
+4. aplica as regras **em memória, na ordem de chegada**;
+5. grava com `INSERT`s multi-linha (transações, ledger em ordem de versão, journal, outbox), **um** `UPDATE` da wallet e um `UPDATE` de dependentes;
+6. faz o COMMIT;
+7. dá o ack de todas com `DeleteMessageBatch`.
+
+**Equivalência com o processamento um a um.** Essa é a regra que norteou o desenho:
+- **Overlay em memória.** Cada item enxerga o que os anteriores do mesmo lote criaram:
+  - uma `BET` e o seu `ROLLBACK` no mesmo lote;
+  - um `REFUND` seguido de `ROLLBACK` da mesma `BET`, em que o segundo é rejeitado como já revertido;
+  - chave repetida, que vira replay;
+  - payload divergente, que vira conflito;
+  - `externalId` reutilizado;
+  - o mesmo `messageId` duas vezes, em que a cópia espelha a primeira.
+- **Teste de equivalência.** Uma sequência com todos esses casos, mais referência fora de ordem e saldo insuficiente, é aplicada em lote numa wallet e uma a uma noutra. Os resultados por item, o saldo, a versão e o ledger precisam ser idênticos ([wager-batch.test.ts](test/integration/wager-batch.test.ts)).
+- **Um único algoritmo.** O HTTP chama `execute`, que é um lote de 1. Toda a suíte existente valida o mesmo código.
+
+**Falhas.**
+- **Recusa de um item** (conflito, validação): só esse item vai para a DLQ, com auditoria. O registro de inbox dele é removido na mesma transação, para que uma reentrega ou redrive seja reavaliada como se a transação tivesse sido revertida.
+- **Falha do lote inteiro** (wallet inexistente, transitória esgotada, erro inesperado): cada mensagem cai no caminho individual. Esse caminho tem a classificação completa (orçamento de retries, `FAILED`, auditoria). **O lote nunca muda o resultado de uma mensagem, só quantas transações ela custa.**
+
+**Mudança no schema** (migration `Migration20261011000001BatchWalletVersion`, reversível). Um lote salva a wallet uma vez, com a versão avançando N, e o saldo pode até terminar igual (BET 10 + WIN 10 = +2 versões). A regra de linha "versão +1 se e só se o saldo muda" foi trocada por "a versão nunca diminui e o saldo não muda sem a versão aumentar". A garantia de verdade continua no schema e **não mudou**:
+- `UNIQUE (wallet_id, wallet_version)` + trigger de cadeia: versões contíguas, cada uma continuando a anterior;
+- *constraint trigger* diferido: no COMMIT, `(version, balance)` da wallet é o último elo da cadeia.
+
+Um salto de N só é aceito se as N linhas existirem. Saltos com buracos continuam barrados, e há teste para isso.
+
+**Resultado medido** (drenagem de uma fila pré-carregada, [LOAD_TEST](docs/LOAD_TEST.md)):
+- **Tráfego concentrado** (10 wallets): **3,5× menos transações SQL** (4,3 mensagens por transação), **+48% de vazão** e o CPU do emulador cai de 79% para 42% com o ack em lote.
+- **Tráfego espalhado** (100 wallets): cada receive traz no máximo 10 mensagens de vários grupos, o lote fica em ~1 por wallet e **não há ganho**. Isso é esperado: o lote ataca o teto por wallet, não a vazão global.
+
+**Configuração:** `SQS_BATCH_PER_WALLET` (padrão `true`; `false` volta ao processamento um a um).
+
+**Regressão encontrada no caminho:** ao revisar o algoritmo, apareceu um bug que já existia no caminho individual. Numa rejeição `REFERENCE_MISMATCH` cuja referência era de **outra wallet**, o processor gravava o vínculo `reference_transaction_id`, a FK composta recusava o INSERT e o resultado era 500 em vez de 422. Corrigido: só se vincula referência da mesma wallet. Há teste de regressão.
+
 ---
 
 ## 3. Schema e invariantes no banco
@@ -249,7 +291,7 @@ Migrations escritas à mão, versionadas e reversíveis (`up`/`down`, testadas),
 | Uma wallet por `(player, currency)` | `UNIQUE wallets_player_currency_uk` |
 | Saldo nunca negativo | `CHECK (balance_amount >= 0)` em wallets; `CHECK` em `balance_before/after` no ledger |
 | Valores positivos (LOSS pode ser 0) | `CHECK (amount > 0 OR (kind='LOSS' AND amount=0))`; ledger `amount > 0` |
-| `version` muda **+1** se e só se o saldo muda | trigger `wallets_update_guard` |
+| A versão nunca diminui e o saldo não muda sem a versão aumentar (um lote avança N de uma vez, ADR-14) | trigger `wallets_update_guard` (migration `BatchWalletVersion`) |
 | Colunas de identidade imutáveis; wallets nunca deletadas | trigger `wallets_update_guard` |
 | Aritmética de cada lançamento | `CHECK ledger_arithmetic_ck` (`after = before ± amount`) |
 | No máximo um lançamento por transação e wallet | `UNIQUE (transaction_id, wallet_id)` |
@@ -413,17 +455,20 @@ sequenceDiagram
 ## 8. Escalabilidade e performance
 
 - **Horizontal:** as instâncias são stateless. Todas as coordenações (lock por wallet, idempotência, inbox, claim da outbox e dos pendentes) estão no PostgreSQL. Cada papel pode escalar separadamente via `APP_ROLES`.
-- **Contenção restrita à wallet.** Wallets distintas não competem. O teto de uma hot wallet é `1 / tempo de lock` (~8 ms → ~125 TPS no ambiente local). Mitigações fora do escopo: reduzir os round-trips dentro do lock com uma stored procedure, ou particionar o saldo de wallets "da casa".
+- **Contenção restrita à wallet.** Wallets distintas não competem. O teto de uma hot wallet é `1 / tempo de lock` (~8 ms → ~125 TPS no ambiente local). O **lote por wallet** (ADR-14) amortiza lock e COMMIT entre as mensagens da mesma wallet no SQS: 3,5× menos transações e +48% de vazão com tráfego concentrado. Próximos passos: reduzir os round-trips dentro do lock com uma stored procedure, e o shard por wallet para ir além de um único Postgres.
 - **Conexões:** `DB_POOL_MAX × instâncias < max_connections`. Por usar só `SET LOCAL`, a aplicação é compatível com PgBouncer em *transaction pooling*.
 - **SQS FIFO:** o paralelismo é por `MessageGroupId` (wallet). Em AWS real, o *high throughput FIFO* remove o teto por fila.
 - **Crescimento:** particionar o ledger, o journal e a outbox por tempo; arquivar a outbox publicada e o inbox expurgado; usar LISTEN/NOTIFY para reduzir a latência da outbox sem polling.
-- **Medições e análise:** [docs/LOAD_TEST.md](docs/LOAD_TEST.md). O resumo: a API sustenta ~340 req/s com 0 erros no desktop local, e o gargalo do caminho assíncrono foi o **emulador** SQS (CPU a 99%), não o desenho.
+- **Medições e análise:** [docs/LOAD_TEST.md](docs/LOAD_TEST.md). O resumo, no desktop local e com 0 erros:
+  - a API sustenta ~340 req/s;
+  - o consumidor drena a fila a 220–330 msg/s, com o emulador SQS (um core) como teto;
+  - medições antigas de ~15 msg/s estavam contaminadas por backlog acumulado no emulador e foram refeitas em stack zerada.
 
 ---
 
 ## 9. Estratégia de testes
 
-São 193 testes. **Nenhum mock de PostgreSQL ou SQS**: integração e concorrência rodam contra PostgreSQL 17 e MiniStack reais (`docker-compose.test.yml`). Cada suíte usa um **banco isolado**, clonado de um template migrado (`CREATE DATABASE … TEMPLATE`), e **filas com sufixo único**. O invariante final roda ao fim de todas as suítes: `assertAllWalletsConsistent` verifica saldo = Σledger, a cadeia de versões contínua e a versão final igual à da wallet.
+São 204 testes. **Nenhum mock de PostgreSQL ou SQS**: integração e concorrência rodam contra PostgreSQL 17 e MiniStack reais (`docker-compose.test.yml`). Cada suíte usa um **banco isolado**, clonado de um template migrado (`CREATE DATABASE … TEMPLATE`), e **filas com sufixo único**. O invariante final roda ao fim de todas as suítes: `assertAllWalletsConsistent` verifica saldo = Σledger, a cadeia de versões contínua e a versão final igual à da wallet.
 
 | Exigência do enunciado | Onde |
 |---|---|
@@ -443,6 +488,7 @@ São 193 testes. **Nenhum mock de PostgreSQL ou SQS**: integração e concorrên
 | 7. ROLLBACK/REFUND antes da referência | `outbox-and-references.test.ts` (+ orçamento esgotado e 3 workers concorrentes) |
 | 8. reinício com prova de consistência | `multi-instance.test.ts` #8 (SIGKILL em todas as instâncias no meio do tráfego e restart) |
 | Auditoria e `FAILED` (ADR-12) | `submission-failures.test.ts` (HTTP: payload inválido, conflito, wallet inexistente, reenvio corrigido; SQS: erro inesperado esgotado → `FAILED`, poison message; imutabilidade), `sqs-consumer.test.ts` (transitória esgotada → `RETRIES_EXHAUSTED`, sem `FAILED`) |
+| Lote por wallet (ADR-14) | `wager-batch.test.ts` (equivalência lote × sequencial, referência fora de ordem dentro do lote, lote com saldo líquido zero, `messageId` repetido, reentrega de lote inteiro, cenário obrigatório num lote, lotes concorrentes, referência de outra wallet), `sqs-batch.test.ts` (SQS real: N mensagens numa transação, poison no meio do grupo, fallback de wallet inexistente), `schema-constraints.test.ts` (salto de versão só com todas as linhas) |
 
 Ferramentas de suporte:
 - `FaultInjector`: pontos de crash só para teste, ignorados em produção;
@@ -458,6 +504,7 @@ Ferramentas de suporte:
 - **Contexto de trace na outbox.** O trace da requisição original não é gravado na outbox, então o span de publicação começa um trace novo. Próximo passo: adicionar uma coluna `traceparent`.
 - **Ordem entre publishers** é *best effort*. Os consumidores devem usar `walletVersion` e deduplicar por `eventId`.
 - **Testes de multi-processo e timing.** Uma execução isolada falhou no cenário #5 por mensagem residual de outro cenário. A causa foi corrigida com filas dedicadas, e depois disso foram 10 execuções seguidas sem falha. Como os testes dependem de tempo, um ambiente muito saturado pode aumentar a latência; os timeouts são generosos.
-- **Hot wallet.** O limite é o tempo de lock. Reduzir os round-trips dentro do lock (stored procedure ou CTE única) é a principal otimização pendente.
+- **Hot wallet no HTTP.** O lote só atua no SQS: no HTTP cada requisição é um lote de 1, e o teto continua sendo o tempo de lock. Juntar requisições HTTP da mesma wallet exigiria uma janela de espera e roteamento por wallet no load balancer; não foi feito.
+- **Lote e tráfego espalhado.** Com mensagens distribuídas por muitas wallets, cada receive traz ~1 mensagem por wallet e o lote não ajuda (ADR-14).
 - **Emulador.** Os números assíncronos no ambiente local refletem o MiniStack (Python, um core), não o SQS real.
 - **Autenticação** não implementada (veja o ADR-09). Rate limiting ficaria no gateway.

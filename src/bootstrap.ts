@@ -90,6 +90,7 @@ export async function startApplication(config: AppConfig): Promise<RunningApplic
           maxReceiveCount: config.SQS_MAX_RECEIVE_COUNT,
           backoffBaseSeconds: config.SQS_TRANSIENT_BACKOFF_BASE_S,
           backoffMaxSeconds: config.SQS_TRANSIENT_BACKOFF_MAX_S,
+          batchPerWallet: config.SQS_BATCH_PER_WALLET,
         },
         metrics,
         logger,

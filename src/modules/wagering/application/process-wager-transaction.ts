@@ -1,4 +1,5 @@
 import {
+  type ApplicationError,
   IdempotencyConflictError,
   ValidationError,
   WalletNotFoundForSubmissionError,
@@ -15,6 +16,7 @@ import { Money, type MoneyProps } from "../../../shared/domain/money";
 import type { Clock, IdGenerator } from "../../../shared/domain/ports";
 import { InboxMessage } from "../../messaging/domain/inbox-message";
 import { OutboxMessage } from "../../messaging/domain/outbox-message";
+import type { WalletLedgerEntry } from "../../wallet/domain/wallet-ledger-entry";
 import { counterpartyAccountFor } from "../domain/counterparty";
 import { WagerTransactionFailed } from "../domain/events/wagering-events";
 import type { FailureCode } from "../domain/failure-code";
@@ -58,10 +60,31 @@ export interface SubmitWagerResult {
   duplicateMessage: boolean;
 }
 
+/** Per-item outcome of a batch: a business result, or the error that refused this item alone. */
+export type BatchItemOutcome =
+  | { ok: true; result: SubmitWagerResult }
+  | { ok: false; error: ApplicationError };
+
+interface PreparedItem {
+  cmd: SubmitWagerCommand;
+  money: Money;
+  payloadHash: string;
+}
+
+const extKey = (providerId: string, externalTransactionId: string) =>
+  `${providerId}\u0000${externalTransactionId}`;
+
 /**
- * The single wagering use case shared by HTTP and SQS. One SQL transaction contains:
- * inbox record → wallet row lock → idempotency check → business rules → transaction row →
- * wallet balance → ledger entry → outbox events. Either all of it commits or none of it does.
+ * The single wagering use case shared by HTTP and SQS.
+ *
+ * `executeBatch` applies N submissions of ONE wallet inside ONE SQL transaction: inbox records → wallet row lock
+ * (once) → idempotency and reference lookups (one query each) → business rules applied in memory, in order →
+ * multi-row inserts (transactions, ledger, journal, outbox) → one wallet update → COMMIT. It is equivalent to
+ * processing the items one by one: an in-memory overlay lets each item see what earlier items of the same batch
+ * created (references, reversals, repeated keys, repeated messageIds), and the database constraints validate the
+ * final state at COMMIT exactly as they would for N separate transactions.
+ *
+ * `execute` is a batch of one, so HTTP and SQS run the very same algorithm.
  */
 export class ProcessWagerTransaction {
   private readonly processor = new WagerProcessor();
@@ -76,24 +99,37 @@ export class ProcessWagerTransaction {
   ) {}
 
   async execute(cmd: SubmitWagerCommand): Promise<SubmitWagerResult> {
+    const [outcome] = await this.executeBatch([cmd]);
+    if (!outcome) throw new Error("unreachable: empty batch outcome");
+    if (!outcome.ok) throw outcome.error;
+    return outcome.result;
+  }
+
+  /**
+   * @param cmds submissions for the SAME wallet, in arrival order.
+   * @throws WalletNotFoundForSubmissionError when the wallet does not exist (nothing is committed);
+   *         TransientInfrastructureError after bounded retries; unexpected errors roll the whole batch back.
+   */
+  async executeBatch(cmds: readonly SubmitWagerCommand[]): Promise<BatchItemOutcome[]> {
+    if (cmds.length === 0) return [];
+    const walletId = cmds[0]?.walletId as string;
+    if (cmds.some((c) => c.walletId !== walletId)) throw new Error("a batch must target a single wallet");
     const started = performance.now();
-    if (!(EXTERNAL_KINDS as readonly string[]).includes(cmd.kind)) {
-      throw new ValidationError(`kind ${String(cmd.kind)} cannot be submitted`, { kind: cmd.kind });
-    }
-    const money = this.parseMoney(cmd.money);
-    const payloadHash = computeWagerPayloadHash(cmd);
-    logContext.assign({
-      walletId: cmd.walletId,
-      providerId: cmd.providerId,
-      correlationId: cmd.correlationId,
-    });
 
-    const result = await this.uow.transaction((scope) => this.run(scope, cmd, money, payloadHash), {
-      label: "process-wager",
-    });
+    const prepared = cmds.map((cmd) => this.prepare(cmd));
+    logContext.assign({ walletId, providerId: cmds[0]?.providerId, correlationId: cmds[0]?.correlationId });
 
-    this.record(cmd, result, started);
-    return result;
+    const outcomes = prepared.every((p) => "error" in p)
+      ? prepared.map((p) => ({ ok: false as const, error: (p as { error: ApplicationError }).error }))
+      : await this.uow.transaction((scope) => this.run(scope, walletId, prepared), {
+          label: cmds.length > 1 ? "process-wager-batch" : "process-wager",
+        });
+
+    outcomes.forEach((outcome, i) => {
+      const cmd = cmds[i] as SubmitWagerCommand;
+      if (outcome.ok) this.record(cmd, outcome.result, started);
+    });
+    return outcomes;
   }
 
   /**
@@ -105,13 +141,8 @@ export class ProcessWagerTransaction {
    * existing transaction when the key was meanwhile processed (FAILED never overwrites a real outcome).
    */
   async markFailed(cmd: SubmitWagerCommand, code: FailureCode): Promise<SubmitWagerResult | undefined> {
-    let money: Money;
-    try {
-      money = this.parseMoney(cmd.money);
-    } catch {
-      return undefined;
-    }
-    const payloadHash = computeWagerPayloadHash(cmd);
+    const item = this.prepare(cmd);
+    if ("error" in item) return undefined;
     return this.uow.transaction(
       async (scope) => {
         const now = this.clock.now();
@@ -127,12 +158,12 @@ export class ProcessWagerTransaction {
 
         let tx: WagerTransaction;
         try {
-          tx = this.createTransaction(cmd, money, payloadHash, now);
+          tx = this.createTransaction(item, now);
         } catch {
           return undefined;
         }
         tx.fail(code, now, wallet.balance);
-        await scope.wagers.insert(tx);
+        await scope.wagers.insertMany([tx]);
         await scope.outbox.add([
           OutboxMessage.enqueue(
             WagerTransactionFailed.from(tx, {
@@ -153,138 +184,262 @@ export class ProcessWagerTransaction {
 
   private async run(
     scope: TransactionScope,
-    cmd: SubmitWagerCommand,
-    money: Money,
-    payloadHash: string,
-  ): Promise<SubmitWagerResult> {
+    walletId: string,
+    items: readonly (PreparedItem | { error: ApplicationError })[],
+  ): Promise<BatchItemOutcome[]> {
     const now = this.clock.now();
-
-    // 1. Inbox: first statement, so a concurrent redelivery blocks here until we commit/rollback.
-    //    The row only becomes visible at COMMIT, together with the effect, so it is written as processed.
-    if (cmd.inbox) {
-      const inbox = InboxMessage.receive({ ...cmd.inbox, receivedAt: now });
-      inbox.markProcessed(now);
-      const inserted = await scope.inbox.tryInsert(inbox);
-      if (!inserted) return this.duplicateMessage(scope, cmd);
-    }
-
-    // 2. Serialise on the wallet (unit of concurrency). Different wallets never contend.
-    const wallet = await scope.wallets.lockById(cmd.walletId);
-    if (!wallet) throw new WalletNotFoundForSubmissionError(cmd.walletId);
-
-    // 3. Idempotency — evaluated *after* the lock, so a concurrent duplicate sees the committed original.
-    //    One round trip for both uniqueness keys (idempotency key, provider + external id).
-    const { byKey: existing, byExternal: sameExternal } = await scope.wagers.findIdempotencyCandidates(
-      cmd.idempotencyKey,
-      cmd.providerId,
-      cmd.externalTransactionId,
+    const out: (BatchItemOutcome | undefined)[] = items.map((it) =>
+      "error" in it ? { ok: false, error: it.error } : undefined,
     );
-    if (existing) {
-      if (!existing.matchesPayload(payloadHash)) {
-        throw new IdempotencyConflictError("PAYLOAD_MISMATCH", {
-          idempotencyKey: cmd.idempotencyKey,
-          transactionId: existing.id,
-        });
+    const live = items.flatMap((it, i) => ("error" in it ? [] : [{ ...it, i }]));
+
+    // 1. Inbox first: a concurrent redelivery blocks on these keys until we commit/rollback. Rows become visible
+    //    only at COMMIT, together with the effect, so they are written as processed.
+    const ownedInbox = new Map<string, number>(); // messageId → index that inserted it in this batch
+    const repeatedInBatch = new Map<number, number>(); // index → earlier index with the same messageId
+    const alreadyInInbox = new Set<number>();
+    const queued = live.filter((it) => it.cmd.inbox);
+    if (queued.length > 0) {
+      const first = new Map<string, number>();
+      for (const it of queued) {
+        const messageId = it.cmd.inbox?.messageId as string;
+        const earlier = first.get(messageId);
+        if (earlier === undefined) first.set(messageId, it.i);
+        else repeatedInBatch.set(it.i, earlier);
       }
-      return toResult(existing, true);
-    }
-    if (sameExternal) {
-      throw new IdempotencyConflictError("EXTERNAL_ID_REUSED", {
-        providerId: cmd.providerId,
-        externalTransactionId: cmd.externalTransactionId,
-        transactionId: sameExternal.id,
-      });
+      const consumerName = queued[0]?.cmd.inbox?.consumerName as string;
+      const inserted = await scope.inbox.tryInsertMany(
+        [...first.values()].map((i) => {
+          const inbox = (items[i] as PreparedItem).cmd.inbox as NonNullable<SubmitWagerCommand["inbox"]>;
+          const message = InboxMessage.receive({ ...inbox, receivedAt: now });
+          message.markProcessed(now);
+          return message;
+        }),
+      );
+      for (const [messageId, i] of first) {
+        if (inserted.has(messageId)) ownedInbox.set(messageId, i);
+        else alreadyInInbox.add(i);
+      }
+      if (alreadyInInbox.size > 0) {
+        const previous = await scope.inbox.findMany(
+          consumerName,
+          [...alreadyInInbox].map((i) => (items[i] as PreparedItem).cmd.inbox?.messageId as string),
+        );
+        const hashByMessage = new Map(previous.map((m) => [m.messageId, m.payloadHash]));
+        for (const i of alreadyInInbox) {
+          const inbox = (items[i] as PreparedItem).cmd.inbox as NonNullable<SubmitWagerCommand["inbox"]>;
+          const previousHash = hashByMessage.get(inbox.messageId);
+          if (previousHash !== undefined && previousHash !== inbox.payloadHash) {
+            out[i] = conflict("INBOX_PAYLOAD_MISMATCH", { messageId: inbox.messageId });
+          }
+        }
+      }
     }
 
-    // 4. Build the transaction (contract validation lives in the factory).
-    const tx = this.createTransaction(cmd, money, payloadHash, now);
-    logContext.assign({ transactionId: tx.id });
-
-    // 5. Resolve reference (same wallet lock protects it) and apply business rules.
-    const reference = tx.hasReference() ? await lookupReference(scope, tx) : undefined;
+    // 2. Serialise on the wallet, once for the whole batch. Different wallets never contend.
+    const wallet = await scope.wallets.lockById(walletId);
+    if (!wallet) throw new WalletNotFoundForSubmissionError(walletId);
     const versionBefore = wallet.version;
-    const outcome = this.processor.process({
-      wallet,
-      transaction: tx,
-      reference,
-      ledgerEntryId: this.ids.next(),
-      at: now,
-      nextReferenceRetryAt: this.retryPolicy.nextRetryAt(0, now),
-      referenceRetryExhausted: false,
-    });
 
-    // 6. Persist everything in this transaction.
-    await scope.wagers.insert(tx);
-    if (outcome.type === "PROCESSED" && outcome.ledgerEntry) {
-      await scope.wallets.saveBalance(wallet, versionBefore);
-      await scope.ledger.insert(outcome.ledgerEntry, counterpartyAccountFor(tx));
-    }
-    const events = outboxMessagesFor(
-      outcome,
-      tx,
-      wallet,
-      { correlationId: cmd.correlationId, causationId: cmd.causationId, occurredAt: now },
-      this.ids,
+    // 3. Idempotency (one query for every key and external id) — after the lock, so concurrent duplicates see
+    //    committed originals.
+    const undecided = live.filter((it) => out[it.i] === undefined);
+    const persisted = await scope.wagers.findIdempotencyCandidatesMany(
+      undecided.map((it) => it.cmd.idempotencyKey),
+      undecided.map((it) => ({
+        providerId: it.cmd.providerId,
+        externalTransactionId: it.cmd.externalTransactionId,
+      })),
     );
+    const byKey = new Map(persisted.map((t) => [t.idempotencyKey, t]));
+    const byExternal = new Map(persisted.map((t) => [extKey(t.providerId, t.externalTransactionId), t]));
+
+    // 4. References (one query) and which of them are already reversed (one query).
+    const referencePairs = undecided
+      .filter((it) => it.cmd.referenceExternalTransactionId)
+      .map((it) => ({
+        providerId: it.cmd.providerId,
+        externalTransactionId: it.cmd.referenceExternalTransactionId as string,
+      }));
+    const references =
+      referencePairs.length > 0 ? await scope.wagers.findByProviderExternalIds(referencePairs) : [];
+    for (const r of references) byExternal.set(extKey(r.providerId, r.externalTransactionId), r);
+    const reversed =
+      references.length > 0
+        ? await scope.wagers.reversedAmong(references.map((r) => r.id))
+        : new Set<string>();
+
+    // 5. Apply in arrival order. byKey/byExternal double as the in-batch overlay: each item sees the transactions
+    //    created by the items before it.
+    const created: WagerTransaction[] = [];
+    const ledger: { entry: WalletLedgerEntry; counterpartyAccount: string }[] = [];
+    const events: OutboxMessage[] = [];
+    const nudges: { providerId: string; externalTransactionId: string }[] = [];
+
+    for (const it of live) {
+      if (out[it.i] !== undefined || repeatedInBatch.has(it.i)) continue;
+      const { cmd } = it;
+
+      if (alreadyInInbox.has(it.i)) {
+        // Redelivery of a committed message: answer with the original outcome.
+        const original = byKey.get(cmd.idempotencyKey);
+        out[it.i] = original
+          ? { ok: true, result: { ...toResult(original, true), duplicateMessage: true } }
+          : conflict("INBOX_PAYLOAD_MISMATCH", { messageId: cmd.inbox?.messageId });
+        continue;
+      }
+
+      const existing = byKey.get(cmd.idempotencyKey);
+      if (existing) {
+        out[it.i] = existing.matchesPayload(it.payloadHash)
+          ? { ok: true, result: toResult(existing, true) }
+          : conflict("PAYLOAD_MISMATCH", { idempotencyKey: cmd.idempotencyKey, transactionId: existing.id });
+        continue;
+      }
+      const sameExternal = byExternal.get(extKey(cmd.providerId, cmd.externalTransactionId));
+      if (sameExternal) {
+        out[it.i] = conflict("EXTERNAL_ID_REUSED", {
+          providerId: cmd.providerId,
+          externalTransactionId: cmd.externalTransactionId,
+          transactionId: sameExternal.id,
+        });
+        continue;
+      }
+
+      let tx: WagerTransaction;
+      try {
+        tx = this.createTransaction(it, now);
+      } catch (error) {
+        if (error instanceof ValidationError) {
+          out[it.i] = { ok: false, error };
+          continue;
+        }
+        throw error;
+      }
+      if (live.length === 1) logContext.assign({ transactionId: tx.id });
+
+      let reference: ReferenceLookup | undefined;
+      if (tx.referenceExternalTransactionId) {
+        const ref = byExternal.get(extKey(tx.providerId, tx.referenceExternalTransactionId));
+        reference = ref
+          ? {
+              found: true,
+              transaction: ref,
+              alreadyReversed:
+                tx.isReversal() && ref.status === WagerTransactionStatus.Processed && reversed.has(ref.id),
+            }
+          : { found: false };
+      }
+
+      const outcome = this.processor.process({
+        wallet,
+        transaction: tx,
+        reference,
+        ledgerEntryId: this.ids.next(),
+        at: now,
+        nextReferenceRetryAt: this.retryPolicy.nextRetryAt(0, now),
+        referenceRetryExhausted: false,
+      });
+
+      created.push(tx);
+      byKey.set(tx.idempotencyKey, tx);
+      byExternal.set(extKey(tx.providerId, tx.externalTransactionId), tx);
+      if (outcome.type === "PROCESSED") {
+        if (outcome.ledgerEntry)
+          ledger.push({ entry: outcome.ledgerEntry, counterpartyAccount: counterpartyAccountFor(tx) });
+        if (tx.isReversal() && tx.referenceTransactionId) reversed.add(tx.referenceTransactionId);
+        nudges.push({ providerId: tx.providerId, externalTransactionId: tx.externalTransactionId });
+      }
+      events.push(
+        ...outboxMessagesFor(
+          outcome,
+          tx,
+          wallet,
+          { correlationId: cmd.correlationId, causationId: cmd.causationId, occurredAt: now },
+          this.ids,
+        ),
+      );
+      out[it.i] = { ok: true, result: toResult(tx, false) };
+    }
+
+    // Same messageId twice inside one batch: the later copy mirrors the first (replay or the same refusal).
+    for (const [i, first] of repeatedInBatch) {
+      const original = out[first];
+      const sameContent =
+        (items[i] as PreparedItem).cmd.inbox?.payloadHash ===
+        (items[first] as PreparedItem).cmd.inbox?.payloadHash;
+      if (!sameContent) {
+        out[i] = conflict("INBOX_PAYLOAD_MISMATCH", {
+          messageId: (items[i] as PreparedItem).cmd.inbox?.messageId,
+        });
+      } else if (original?.ok) {
+        out[i] = { ok: true, result: { ...original.result, idempotentReplay: true, duplicateMessage: true } };
+      } else {
+        out[i] = original;
+      }
+    }
+
+    // 6. Persist: multi-row writes, one wallet update for the whole batch.
+    await scope.wagers.insertMany(created);
+    if (ledger.length > 0) {
+      await scope.wallets.saveBalance(wallet, versionBefore);
+      await scope.ledger.insertMany(ledger);
+    }
     await scope.outbox.add(events);
-    if (outcome.type === "PROCESSED") {
-      await scope.wagers.nudgeDependents(wallet.id, tx.providerId, tx.externalTransactionId, now);
+    if (nudges.length > 0) await scope.wagers.nudgeDependentsMany(walletId, nudges, now);
+
+    // 7. Items refused inside the batch must not keep an inbox record (a later redelivery or DLQ redrive has to be
+    //    evaluated again, exactly as if its transaction had rolled back).
+    const refusedInbox = [...ownedInbox]
+      .filter(([, i]) => out[i]?.ok === false)
+      .map(([messageId]) => messageId);
+    if (refusedInbox.length > 0) {
+      const consumerName = (items[ownedInbox.values().next().value as number] as PreparedItem).cmd.inbox
+        ?.consumerName as string;
+      await scope.inbox.deleteMany(consumerName, refusedInbox);
     }
-    return toResult(tx, false);
+
+    return out.map((o) => {
+      if (!o) throw new Error("unreachable: undecided batch item");
+      return o;
+    });
   }
 
-  private async duplicateMessage(
-    scope: TransactionScope,
-    cmd: SubmitWagerCommand,
-  ): Promise<SubmitWagerResult> {
-    const inboxCmd = cmd.inbox;
-    if (!inboxCmd) throw new Error("unreachable: duplicate without inbox");
-    const previous = await scope.inbox.find(inboxCmd.consumerName, inboxCmd.messageId);
-    if (previous && previous.payloadHash !== inboxCmd.payloadHash) {
-      throw new IdempotencyConflictError("INBOX_PAYLOAD_MISMATCH", { messageId: inboxCmd.messageId });
+  private prepare(cmd: SubmitWagerCommand): PreparedItem | { error: ApplicationError } {
+    if (!(EXTERNAL_KINDS as readonly string[]).includes(cmd.kind)) {
+      return {
+        error: new ValidationError(`kind ${String(cmd.kind)} cannot be submitted`, { kind: cmd.kind }),
+      };
     }
-    const tx = await scope.wagers.findByIdempotencyKey(cmd.idempotencyKey);
-    if (!tx) {
-      // Inbox row exists but its transaction does not: only possible if the original was a permanent
-      // rejection that committed no transaction row (e.g. WALLET_NOT_FOUND never commits) — treat as conflict.
-      throw new IdempotencyConflictError("INBOX_PAYLOAD_MISMATCH", { messageId: inboxCmd.messageId });
+    try {
+      return { cmd, money: Money.from(cmd.money), payloadHash: computeWagerPayloadHash(cmd) };
+    } catch (error) {
+      if (error instanceof DomainError)
+        return { error: new ValidationError(error.message, { field: "money" }) };
+      throw error;
     }
-    return { ...toResult(tx, true), duplicateMessage: true };
   }
 
-  private createTransaction(
-    cmd: SubmitWagerCommand,
-    money: Money,
-    payloadHash: string,
-    now: Date,
-  ): WagerTransaction {
+  private createTransaction(item: PreparedItem, now: Date): WagerTransaction {
+    const { cmd } = item;
     try {
       return WagerTransaction.create({
         id: this.ids.next(),
         providerId: cmd.providerId,
         externalTransactionId: cmd.externalTransactionId,
         idempotencyKey: cmd.idempotencyKey,
-        payloadHash,
+        payloadHash: item.payloadHash,
         walletId: cmd.walletId,
         playerId: cmd.playerId,
         roundId: cmd.roundId,
         gameId: cmd.gameId,
         kind: cmd.kind as WagerTransactionKind,
-        money,
+        money: item.money,
         referenceExternalTransactionId: cmd.referenceExternalTransactionId,
         createdAt: now,
       });
     } catch (error) {
       if (error instanceof DomainError) throw new ValidationError(error.message, { code: error.code });
-      throw error;
-    }
-  }
-
-  private parseMoney(props: MoneyProps): Money {
-    try {
-      return Money.from(props);
-    } catch (error) {
-      if (error instanceof DomainError) throw new ValidationError(error.message, { field: "money" });
       throw error;
     }
   }
@@ -298,6 +453,7 @@ export class ProcessWagerTransaction {
     this.logger.info(
       {
         transactionId: result.transactionId,
+        messageId: cmd.inbox?.messageId,
         status: result.status,
         failureCode: result.failureCode,
         kind: cmd.kind,
@@ -308,6 +464,13 @@ export class ProcessWagerTransaction {
       "wager transaction handled",
     );
   }
+}
+
+function conflict(
+  reason: "PAYLOAD_MISMATCH" | "EXTERNAL_ID_REUSED" | "INBOX_PAYLOAD_MISMATCH",
+  details: Record<string, unknown>,
+): BatchItemOutcome {
+  return { ok: false, error: new IdempotencyConflictError(reason, details) };
 }
 
 export async function lookupReference(

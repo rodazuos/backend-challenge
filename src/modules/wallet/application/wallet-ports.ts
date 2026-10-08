@@ -26,8 +26,11 @@ export interface LedgerAggregate {
 }
 
 export interface LedgerRepository {
-  /** Inserts the wallet sub-ledger line and its two journal postings (wallet leg + counterparty leg). */
-  insert(entry: WalletLedgerEntry, counterpartyAccount: string): Promise<void>;
+  /**
+   * Inserts sub-ledger lines (multi-row, in version order) and their two journal postings each
+   * (wallet leg + counterparty leg).
+   */
+  insertMany(entries: readonly { entry: WalletLedgerEntry; counterpartyAccount: string }[]): Promise<void>;
   /** Newest first, keyset pagination on wallet_version. */
   page(
     walletId: string,

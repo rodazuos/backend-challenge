@@ -46,6 +46,8 @@ const EnvSchema = z.object({
   SQS_TRANSIENT_BACKOFF_BASE_S: int(2, 0),
   SQS_TRANSIENT_BACKOFF_MAX_S: int(60, 1),
   SQS_CONSUMER_NAME: z.string().default("wagering-processor"),
+  /** Apply the messages of one wallet from each receive in a single SQL transaction. */
+  SQS_BATCH_PER_WALLET: bool.default(true),
 
   OUTBOX_POLL_INTERVAL_MS: int(250, 10),
   OUTBOX_BATCH_SIZE: int(100, 1),

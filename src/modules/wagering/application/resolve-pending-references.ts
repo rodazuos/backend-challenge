@@ -101,7 +101,9 @@ export class ResolvePendingReferences {
         await scope.wagers.update(tx);
         if (outcome.type === "PROCESSED" && outcome.ledgerEntry) {
           await scope.wallets.saveBalance(wallet, versionBefore);
-          await scope.ledger.insert(outcome.ledgerEntry, counterpartyAccountFor(tx));
+          await scope.ledger.insertMany([
+            { entry: outcome.ledgerEntry, counterpartyAccount: counterpartyAccountFor(tx) },
+          ]);
         }
         // The original submission is the causation of everything that happens to it later.
         const meta = { correlationId: tx.idempotencyKey, causationId: tx.id, occurredAt: now };

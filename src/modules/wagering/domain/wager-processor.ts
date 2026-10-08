@@ -65,7 +65,9 @@ export class WagerProcessor {
 
       reference = lookup.transaction;
       const failure = this.validateReference(tx, reference, lookup.alreadyReversed);
-      if (failure) return this.reject(input, failure, reference.id);
+      // A reference from another wallet is never linked: the composite FK (reference, wallet) forbids it.
+      if (failure)
+        return this.reject(input, failure, reference.walletId === tx.walletId ? reference.id : undefined);
     }
 
     if (!tx.affectsBalance()) {

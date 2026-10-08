@@ -157,12 +157,49 @@ describe("wallets", () => {
     );
   });
 
-  test("balance change must bump version by exactly one", async () => {
+  test("a balance change must increase the version; versions never decrease", async () => {
     const w = await seedWallet();
     await expectRejected(
       "UPDATE wallets SET balance_amount = 50 WHERE id = $1",
       [w.walletId],
-      /bump version/,
+      /increase the version/,
+    );
+    await expectRejected(
+      "UPDATE wallets SET version = 0 WHERE id = $1",
+      [w.walletId],
+      /cannot decrease|wallets_version_ck/,
+    );
+  });
+
+  test("a batch may advance the version by N only if all N ledger lines exist (no gaps)", async () => {
+    const w = await seedWallet("100.00");
+    const betA = await insertBet(w);
+    const betB = await insertBet(w);
+    // Accepted: v1 → v3 with v2 and v3 present (one wallet update for a batch of two).
+    await db.query("BEGIN");
+    await db.query(
+      `INSERT INTO wallet_ledger_entries VALUES
+         ($1, $3, $4, 'DEBIT', 10, 'BRL', 100, 90, 2, now()),
+         ($2, $3, $5, 'DEBIT', 10, 'BRL', 90, 80, 3, now())`,
+      [uuid(), uuid(), w.walletId, betA, betB],
+    );
+    await postLegs(betA, `wallet:${w.walletId}`, "provider:p:BRL", "DEBIT", "10.00");
+    await postLegs(betB, `wallet:${w.walletId}`, "provider:p:BRL", "DEBIT", "10.00");
+    await db.query("UPDATE wallets SET balance_amount = 80, version = 3 WHERE id = $1", [w.walletId]);
+    await db.query("COMMIT");
+
+    // Rejected: v3 → v5 with only the v5 line (v4 missing) — the chain trigger refuses the gap.
+    const betC = await insertBet(w);
+    await expectRejected(
+      "INSERT INTO wallet_ledger_entries VALUES ($1, $2, $3, 'DEBIT', 10, 'BRL', 70, 60, 5, now())",
+      [uuid(), w.walletId, betC],
+      /chain broken/,
+    );
+    // Rejected: version jump without any ledger line — the deferred consistency check refuses it at COMMIT.
+    await expectRejected(
+      "UPDATE wallets SET balance_amount = 70, version = 5 WHERE id = $1",
+      [w.walletId],
+      /no matching ledger entry/,
     );
   });
 

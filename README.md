@@ -20,7 +20,8 @@ Serviço financeiro distribuído que processa transações de apostas (`BET`, `W
 - **Idempotência persistente.** A chave de idempotência e o par (provider, externalId) são únicos no banco. Há inbox por `(consumer, messageId)` para SQS, e o replay devolve o resultado original.
 - **Outbox transacional.** Publishers concorrentes coordenam o trabalho por lease (`SKIP LOCKED`). Um publisher que cai é substituído automaticamente quando a lease expira.
 - **Auditoria de recusas.** Toda submissão que não vira resultado de negócio (payload inválido, conflito, wallet inexistente, retries esgotados) fica registrada, emite um evento e é consultável pelo provedor, sem ocupar a chave de idempotência. Erros inesperados que esgotam as tentativas viram `FAILED` auditável.
-- **Testes com infraestrutura real.** São 193 testes, com PostgreSQL e SQS reais. Incluem 3 processos Bun simultâneos, `SIGKILL` entre o commit e o ack, publishers que caem no meio do envio e restart com reconciliação final.
+- **Lote por wallet no SQS.** As mensagens de uma mesma wallet chegadas juntas são aplicadas numa única transação SQL, com resultado idêntico ao processamento um a um (há teste de equivalência). Com tráfego concentrado, são 3,5× menos transações e +48% de vazão.
+- **Testes com infraestrutura real.** São 204 testes, com PostgreSQL e SQS reais. Incluem 3 processos Bun simultâneos, `SIGKILL` entre o commit e o ack, publishers que caem no meio do envio e restart com reconciliação final.
 
 ## Início rápido (stack completa)
 
@@ -70,6 +71,7 @@ bun run dev                      # http://localhost:3000
 | `bun run test:concurrency` | corridas reais e cenários com múltiplos processos e crash |
 | `bun test` | tudo (exige `bun run test:infra:up`) |
 | `bun run test:load` | teste de carga contra a stack Docker ([relatório](docs/LOAD_TEST.md)) |
+| `bun run load/sqs-drain.ts prepare` · `measure` | vazão pura do consumidor drenando uma fila pré-carregada ([relatório](docs/LOAD_TEST.md)) |
 | `bun run lint` · `typecheck` · `check:money` | Biome, `tsc` strict e guarda estática contra `number` para dinheiro |
 
 ## API
@@ -109,6 +111,7 @@ Toda a configuração vem do ambiente e é validada com zod no boot. Exemplos es
 | `DB_LOCK_TIMEOUT_MS` | `2000` | espera máxima pelo lock da wallet; depois disso o erro é transitório (503 / retry na fila) |
 | `SQS_MAX_RECEIVE_COUNT` | `5` | tentativas antes da DLQ (redrive policy) |
 | `PENDING_REF_BASE_MS` · `PENDING_REF_MAX_MS` · `PENDING_REF_MAX_ATTEMPTS` | `2000` · `300000` · `10` | backoff de referências fora de ordem (~35 min) |
+| `SQS_BATCH_PER_WALLET` | `true` | aplica as mensagens de uma wallet de cada receive numa única transação SQL |
 | `SUBMISSION_FAILURE_RETENTION_DAYS` | `90` | retenção da auditoria de recusas |
 | `OTEL_ENABLED` | `false` | tracing OTLP (HTTP, PostgreSQL, SQS, outbox) |
 

@@ -39,6 +39,7 @@ const DURATION_S = Number(opt("duration", "30"));
 const CONCURRENCY = Number(opt("concurrency", "64"));
 const WALLETS = Number(opt("wallets", "200"));
 const SQS_MESSAGES = Number(opt("sqs-messages", "3000"));
+const SQS_WALLETS = Number(opt("sqs-wallets", "100"));
 const SCENARIO = opt("scenario", "all");
 
 interface Wallet {
@@ -311,7 +312,13 @@ const environment = {
   },
   bun: Bun.version,
   target: API,
-  settings: { durationS: DURATION_S, concurrency: CONCURRENCY, wallets: WALLETS, sqsMessages: SQS_MESSAGES },
+  settings: {
+    durationS: DURATION_S,
+    concurrency: CONCURRENCY,
+    wallets: WALLETS,
+    sqsMessages: SQS_MESSAGES,
+    sqsWallets: SQS_WALLETS,
+  },
 };
 console.log("environment", JSON.stringify(environment));
 
@@ -347,7 +354,7 @@ if (SCENARIO === "all" || SCENARIO === "hot") {
 }
 
 if (SCENARIO === "all" || SCENARIO === "sqs") {
-  const wallets = await createWallets(Math.min(WALLETS, 100), "100000.00");
+  const wallets = await createWallets(SQS_WALLETS, "100000.00");
   touched.push(...wallets);
   const r = await runSqsScenario(db, wallets);
   results.push(r);

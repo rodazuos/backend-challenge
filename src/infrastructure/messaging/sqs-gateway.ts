@@ -1,6 +1,7 @@
 import {
   ChangeMessageVisibilityCommand,
   CreateQueueCommand,
+  DeleteMessageBatchCommand,
   DeleteMessageCommand,
   GetQueueAttributesCommand,
   GetQueueUrlCommand,
@@ -137,6 +138,22 @@ export class SqsGateway {
         ReceiptHandle: receiptHandle,
       }),
     );
+  }
+
+  /** DeleteMessageBatch in chunks of 10 (the API limit). */
+  async ackMany(receiptHandles: readonly string[]): Promise<void> {
+    const url = await this.queueUrl(this.settings.wagerQueueName);
+    for (let i = 0; i < receiptHandles.length; i += 10) {
+      const chunk = receiptHandles.slice(i, i + 10);
+      const res = await this.client.send(
+        new DeleteMessageBatchCommand({
+          QueueUrl: url,
+          Entries: chunk.map((handle, k) => ({ Id: String(k), ReceiptHandle: handle })),
+        }),
+      );
+      if (res.Failed && res.Failed.length > 0)
+        throw new Error(`${res.Failed.length} message(s) not acknowledged`);
+    }
   }
 
   async changeVisibility(receiptHandle: string, seconds: number): Promise<void> {

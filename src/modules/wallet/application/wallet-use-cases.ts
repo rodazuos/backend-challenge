@@ -76,8 +76,10 @@ export class CreateWallet {
         await scope.wallets.insert(wallet);
         if (opening && openingEntry) {
           opening.markProcessed(undefined, now, wallet.balance);
-          await scope.wagers.insert(opening);
-          await scope.ledger.insert(openingEntry, counterpartyAccountFor(opening));
+          await scope.wagers.insertMany([opening]);
+          await scope.ledger.insertMany([
+            { entry: openingEntry, counterpartyAccount: counterpartyAccountFor(opening) },
+          ]);
           await scope.outbox.add(this.openingEvents(wallet, opening, openingEntry, cmd.correlationId, now));
         }
         return toWalletView(wallet);

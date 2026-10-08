@@ -11,7 +11,7 @@ import {
 import { FailureCode } from "../../modules/wagering/domain/failure-code";
 import { SubmissionFailureCategory } from "../../modules/wagering/domain/submission-failure";
 import type { ExternalWagerKind } from "../../modules/wagering/domain/wager-transaction-kind";
-import { WagerMessageContract } from "../../modules/wagering/infrastructure/contracts";
+import { type WagerMessage, WagerMessageContract } from "../../modules/wagering/infrastructure/contracts";
 import { ApplicationError } from "../../shared/application/errors";
 import { type AppLogger, type AppMetrics, logContext } from "../../shared/application/observability";
 import { computeBackoffMs } from "../../shared/domain/backoff";
@@ -28,6 +28,8 @@ export interface ConsumerSettings {
   maxReceiveCount: number;
   backoffBaseSeconds: number;
   backoffMaxSeconds: number;
+  /** Apply all messages of one wallet from a receive in a single SQL transaction (see handleBatch). */
+  batchPerWallet: boolean;
 }
 
 type Decision =
@@ -122,6 +124,12 @@ export class SqsWagerConsumer {
   }
 
   private async processGroup(group: Message[]): Promise<void> {
+    if (this.settings.batchPerWallet && group.length > 1) {
+      const batch = group.filter((m) => this.running || !this.pending.has(m)); // the rest is released on shutdown
+      for (const m of batch) this.pending.delete(m);
+      if (batch.length > 0) await this.handleBatch(batch);
+      return;
+    }
     for (const message of group) {
       if (!this.running && this.pending.has(message)) continue; // left for release() on shutdown
       this.pending.delete(message);
@@ -130,7 +138,7 @@ export class SqsWagerConsumer {
   }
 
   private async handle(message: Message): Promise<void> {
-    const receiveCount = Number(message.Attributes?.ApproximateReceiveCount ?? 1);
+    const receiveCount = receiveCountOf(message);
     const correlationId = message.MessageAttributes?.correlationId?.StringValue;
     const carrier = Object.fromEntries(
       Object.entries(message.MessageAttributes ?? {}).map(([k, v]) => [k, v.StringValue]),
@@ -161,50 +169,9 @@ export class SqsWagerConsumer {
   }
 
   private async decide(message: Message, receiveCount: number): Promise<Decision> {
-    let raw: unknown;
-    try {
-      raw = JSON.parse(message.Body ?? "");
-    } catch {
-      return this.deadLetter(message, undefined, receiveCount, {
-        reasonCode: "INVALID_JSON",
-        category: SubmissionFailureCategory.Validation,
-        retryable: false,
-        detail: "body is not valid JSON",
-      });
-    }
-    const result = WagerMessageContract.safeParse(raw);
-    if (!result.success) {
-      const detail = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
-      return this.deadLetter(message, raw, receiveCount, {
-        reasonCode: "INVALID_MESSAGE",
-        category: SubmissionFailureCategory.Validation,
-        retryable: false,
-        detail,
-      });
-    }
-    const parsed = result.data;
-    const { data } = parsed;
-    logContext.assign({
-      messageId: parsed.messageId,
-      correlationId: parsed.correlationId ?? logContext.get().correlationId ?? parsed.messageId,
-      providerId: data.providerId,
-      walletId: data.walletId,
-    });
-    const { idempotencyKey, ...payload } = data;
-    const command: SubmitWagerCommand = {
-      ...payload,
-      kind: payload.kind as ExternalWagerKind,
-      idempotencyKey,
-      channel: "sqs",
-      correlationId: logContext.get().correlationId ?? parsed.messageId,
-      causationId: parsed.messageId,
-      inbox: {
-        consumerName: this.settings.consumerName,
-        // The envelope's business content; the same messageId with a different body is a conflict.
-        messageId: parsed.messageId,
-        payloadHash: `v1:${sha256Hex(canonicalJson(data as unknown as Json))}`,
-      },
-    };
+    const parsedMessage = await this.parse(message, receiveCount);
+    if (!parsedMessage.ok) return parsedMessage.decision;
+    const { parsed, command } = parsedMessage;
 
     try {
       this.faults.throwIf("consumer-unexpected-error");
@@ -245,6 +212,154 @@ export class SqsWagerConsumer {
         },
         transactionId,
       );
+    }
+  }
+
+  /**
+   * Validates the envelope and builds the command. Malformed messages are audited and turned into a DLQ decision
+   * right here (they never reach the database).
+   */
+  private async parse(
+    message: Message,
+    receiveCount: number,
+  ): Promise<
+    { ok: true; parsed: WagerMessage; command: SubmitWagerCommand } | { ok: false; decision: Decision }
+  > {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(message.Body ?? "");
+    } catch {
+      return {
+        ok: false,
+        decision: await this.deadLetter(message, undefined, receiveCount, {
+          reasonCode: "INVALID_JSON",
+          category: SubmissionFailureCategory.Validation,
+          retryable: false,
+          detail: "body is not valid JSON",
+        }),
+      };
+    }
+    const result = WagerMessageContract.safeParse(raw);
+    if (!result.success) {
+      const detail = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
+      return {
+        ok: false,
+        decision: await this.deadLetter(message, raw, receiveCount, {
+          reasonCode: "INVALID_MESSAGE",
+          category: SubmissionFailureCategory.Validation,
+          retryable: false,
+          detail,
+        }),
+      };
+    }
+    const parsed = result.data;
+    const { data } = parsed;
+    const correlationId =
+      parsed.correlationId ?? message.MessageAttributes?.correlationId?.StringValue ?? parsed.messageId;
+    logContext.assign({
+      messageId: parsed.messageId,
+      correlationId,
+      providerId: data.providerId,
+      walletId: data.walletId,
+    });
+    const { idempotencyKey, ...payload } = data;
+    const command: SubmitWagerCommand = {
+      ...payload,
+      kind: payload.kind as ExternalWagerKind,
+      idempotencyKey,
+      channel: "sqs",
+      correlationId,
+      causationId: parsed.messageId,
+      inbox: {
+        consumerName: this.settings.consumerName,
+        // The envelope's business content; the same messageId with a different body is a conflict.
+        messageId: parsed.messageId,
+        payloadHash: `v1:${sha256Hex(canonicalJson(data as unknown as Json))}`,
+      },
+    };
+    return { ok: true, parsed, command };
+  }
+
+  /**
+   * Per-wallet batching: all valid messages of one wallet in this receive are applied in ONE SQL transaction
+   * (one lock, one commit, multi-row writes) and acknowledged together after the commit. Malformed messages are
+   * dead-lettered individually. If the batch transaction itself fails (unknown wallet, exhausted transient
+   * retries, unexpected error), every message falls back to the one-by-one path, which owns the full per-message
+   * classification (retry budget, FAILED, audit) — so batching never changes the outcome of a message, only how
+   * many transactions it takes.
+   */
+  private async handleBatch(messages: Message[]): Promise<void> {
+    await logContext.run({ channel: "sqs" }, () =>
+      withSpan(
+        "wager-transactions process batch",
+        { "messaging.system": "aws_sqs", "messaging.batch.message_count": messages.length },
+        async (span) => {
+          const heartbeats = messages.map((m) => this.startHeartbeat(m));
+          const decisions = new Map<Message, Decision>();
+          const fallback: Message[] = [];
+          try {
+            const valid: { message: Message; command: SubmitWagerCommand }[] = [];
+            for (const message of messages) {
+              const parsedMessage = await this.parse(message, receiveCountOf(message));
+              if (parsedMessage.ok) valid.push({ message, command: parsedMessage.command });
+              else decisions.set(message, parsedMessage.decision);
+            }
+            for (const group of groupBy(valid, (v) => v.command.walletId)) {
+              try {
+                this.faults.throwIf("consumer-unexpected-error");
+                const outcomes = await this.processWager.executeBatch(group.map((v) => v.command));
+                // Committed. A crash right here is the "died after commit, before ack" scenario.
+                await this.faults.hit("after-commit-before-ack");
+                for (const [k, outcome] of outcomes.entries()) {
+                  const { message, command } = group[k] as (typeof group)[number];
+                  decisions.set(
+                    message,
+                    outcome.ok
+                      ? { kind: "ack", duplicate: outcome.result.duplicateMessage }
+                      : await this.deadLetter(
+                          message,
+                          { messageId: command.inbox?.messageId, data: command },
+                          receiveCountOf(message),
+                          classifySubmissionError(outcome.error),
+                        ),
+                  );
+                }
+              } catch (error) {
+                this.logger.warn(
+                  { err: error, batchSize: group.length },
+                  "wallet batch failed; falling back to one-by-one processing",
+                );
+                fallback.push(...group.map((v) => v.message));
+              }
+            }
+          } finally {
+            for (const h of heartbeats) clearInterval(h);
+          }
+          span.setAttribute("wagering.batch.fallback", fallback.length);
+
+          const acks = [...decisions].filter(([, d]) => d.kind === "ack") as [
+            Message,
+            { kind: "ack"; duplicate: boolean },
+          ][];
+          await this.ackMany(acks);
+          for (const [message, decision] of decisions) {
+            if (decision.kind !== "ack") await this.apply(message, decision, receiveCountOf(message));
+          }
+          for (const message of fallback) await this.handle(message);
+        },
+        SpanKind.CONSUMER,
+      ),
+    );
+  }
+
+  private async ackMany(acks: [Message, { kind: "ack"; duplicate: boolean }][]): Promise<void> {
+    if (acks.length === 0) return;
+    try {
+      await this.sqs.ackMany(acks.map(([m]) => m.ReceiptHandle).filter((h): h is string => !!h));
+      for (const [, d] of acks) this.metrics.sqsMessage(d.duplicate ? "duplicate" : "ack");
+    } catch (error) {
+      // The messages reappear after their visibility timeout and the inbox absorbs them.
+      this.logger.warn({ err: error, count: acks.length }, "batch ack failed; relying on redelivery");
     }
   }
 
@@ -338,6 +453,19 @@ export class SqsWagerConsumer {
     this.pending.delete(message);
     await this.sqs.changeVisibility(message.ReceiptHandle, 0).catch(() => {});
   }
+}
+
+const receiveCountOf = (m: Message) => Number(m.Attributes?.ApproximateReceiveCount ?? 1);
+
+function groupBy<T>(items: readonly T[], key: (item: T) => string): T[][] {
+  const groups = new Map<string, T[]>();
+  for (const item of items) {
+    const k = key(item);
+    const list = groups.get(k);
+    if (list) list.push(item);
+    else groups.set(k, [item]);
+  }
+  return [...groups.values()];
 }
 
 function groupByMessageGroup(messages: Message[]): Message[][] {

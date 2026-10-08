@@ -2,9 +2,14 @@ import type { InboxMessage } from "../domain/inbox-message";
 import type { OutboxMessage } from "../domain/outbox-message";
 
 export interface InboxRepository {
-  /** INSERT … ON CONFLICT DO NOTHING (processed_at included). Returns false when (consumer, messageId) exists. */
-  tryInsert(message: InboxMessage): Promise<boolean>;
-  find(consumerName: string, messageId: string): Promise<InboxMessage | undefined>;
+  /**
+   * Multi-row INSERT … ON CONFLICT DO NOTHING (processed_at included). Returns the messageIds actually inserted;
+   * the others already exist (redeliveries). A concurrent transaction holding the same key makes this block.
+   */
+  tryInsertMany(messages: readonly InboxMessage[]): Promise<Set<string>>;
+  findMany(consumerName: string, messageIds: readonly string[]): Promise<InboxMessage[]>;
+  /** Removes records of items refused inside a batch (same transaction), so a redelivery is evaluated again. */
+  deleteMany(consumerName: string, messageIds: readonly string[]): Promise<void>;
   purgeReceivedBefore(cutoff: Date, limit: number): Promise<number>;
 }
 
