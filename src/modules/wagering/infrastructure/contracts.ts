@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { isIso4217 } from "../../../shared/domain/currency";
 import { EXTERNAL_KINDS } from "../domain/wager-transaction-kind";
 
 /*
@@ -22,7 +23,9 @@ const uuid = () => z.uuid().transform((v) => v.toLowerCase());
 
 export const MoneyContract = z.strictObject({
   amount: z.string(),
-  currency: z.string(),
+  // A real ISO-4217 code (upper case). Whether it is *enabled* is decided by SUPPORTED_CURRENCIES at wallet opening;
+  // a wager in a valid but different currency is a business outcome (REJECTED CURRENCY_MISMATCH), not a 400.
+  currency: z.string().refine(isIso4217, "currency must be an ISO-4217 code in upper case, e.g. BRL"),
 });
 
 /** "system" is reserved for internal OPENING transactions. */

@@ -70,7 +70,22 @@ O Nest é só a casca HTTP/DI. O núcleo é montado sem framework em `src/compos
 - **`NUMERIC` não viola a restrição "não usar float".** É decimal exato. O risco real está na fronteira DB↔JS, coberta por:
   - um teste de integração que prova que o valor hidrata como `string`;
   - `bun run check:money`, um guard no CI que barra `parseFloat`, `Number()` em código de domínio, campos monetários tipados como `number` e tipos `real`/`float`/`double precision`/`money` em migrations.
-- O modelo é multi-moeda. O desafio usa `BRL`, mas conflitos de moeda são testados (`CurrencyMismatchError` no domínio e `CURRENCY_MISMATCH` como rejeição).
+- **O modelo é multi-moeda.** O enunciado permite assumir só `BRL`, desde que o modelo continue multi-moeda e os conflitos sejam testados. Aqui, N moedas funcionam de verdade:
+  - a moeda é coluna em wallet, transação, ledger e journal. O banco garante uma wallet por `(player, currency)`, ledger na moeda da wallet e journal com uma única moeda por transação;
+  - as contas de contrapartida são por moeda (`provider:{id}:{moeda}`, `system:funding:{moeda}`), então o journal nunca soma moedas diferentes;
+  - um mesmo jogador tem uma wallet por moeda, e elas se movimentam de forma independente.
+- **Moedas habilitadas são configuração.** `SUPPORTED_CURRENCIES` (padrão `BRL,USD,EUR`) é validada no boot contra a lista ISO-4217 do runtime (`Intl.supportedValuesOf`), então um erro de digitação impede a subida.
+
+  | Situação | Resposta |
+  |---|---|
+  | Abrir wallet numa moeda habilitada | `201` |
+  | Abrir wallet numa moeda ISO válida, mas não habilitada | `422 CURRENCY_NOT_SUPPORTED` |
+  | Código que não é ISO-4217 (`XYZ`, `brl`) em qualquer contrato | `400` |
+  | Aposta numa moeda válida, mas diferente da wallet | resultado de negócio `REJECTED(CURRENCY_MISMATCH)`: persistido, auditável e com replay (HTTP `422`; no SQS a mensagem é confirmada, não vai para a DLQ) |
+  | Reversão em outra moeda (e, portanto, em outra wallet) | `REJECTED(REFERENCE_MISMATCH)`, sem tocar nenhuma das duas wallets |
+
+  A lista controla só a **abertura** de wallets. Desabilitar uma moeda depois não congela as wallets existentes, que continuam aceitando estornos e reversões.
+- **Limitação assumida: 2 casas decimais para todas as moedas.** O contrato e o `NUMERIC(20,2)` servem para BRL, USD e EUR. Moedas com 3 casas (KWD, BHD) não são representáveis, e moedas sem centavos (JPY, CLP) aceitariam centavos inexistentes. Suportá-las exigiria uma tabela de casas decimais por moeda (expoente ISO-4217) aplicada no `Money`, no contrato e nas constraints. Isso está fora do escopo do desafio.
 - Alternativa descartada: `BIGINT` em centavos. Também é exato, mas a escala ficaria implícita no código e o `CHECK` aritmético do ledger perderia legibilidade.
 
 ### ADR-03 — Concorrência: lock pessimista por wallet + versão como defesa em profundidade
@@ -391,6 +406,7 @@ O mesmo código para a primeira execução e para o replay. `idempotentReplay` e
 | Payload inválido / header ausente / `OPENING` | **400** | `code:"VALIDATION_ERROR", details.issues[]` | corrigir o payload |
 | Conflito de idempotência / wallet duplicada | **409** | `code:"IDEMPOTENCY_CONFLICT" \| "WALLET_ALREADY_EXISTS"` | não reenviar |
 | Wallet inexistente | **422** | `code:"WALLET_NOT_FOUND"` | corrigir ou criar a wallet |
+| Wallet numa moeda não habilitada | **422** | `code:"CURRENCY_NOT_SUPPORTED", details.supported[]` | usar uma moeda habilitada |
 | Recurso inexistente (GET) | **404** | `code:"…_NOT_FOUND"` | — |
 | Falha transitória (lock timeout, DB/SQS) | **503** + `Retry-After` | `code:"TRANSIENT_FAILURE"` | **reenviar com a mesma chave** |
 | Inesperado | **500** | `code:"INTERNAL_ERROR"` (sem detalhes internos) | reenviar com a mesma chave |
@@ -545,7 +561,7 @@ Visão de ponta a ponta, da borda ao banco. Cada camada assume que a anterior po
 
 ## 9. Estratégia de testes
 
-São 215 testes. **Nenhum mock de PostgreSQL ou SQS**: integração e concorrência rodam contra PostgreSQL 17 e MiniStack reais (`docker-compose.test.yml`). Cada suíte usa um **banco isolado**, clonado de um template migrado (`CREATE DATABASE … TEMPLATE`), e **filas com sufixo único**. O invariante final roda ao fim de todas as suítes: `assertAllWalletsConsistent` verifica saldo = Σledger, a cadeia de versões contínua e a versão final igual à da wallet.
+São 227 testes. **Nenhum mock de PostgreSQL ou SQS**: integração e concorrência rodam contra PostgreSQL 17 e MiniStack reais (`docker-compose.test.yml`). Cada suíte usa um **banco isolado**, clonado de um template migrado (`CREATE DATABASE … TEMPLATE`), e **filas com sufixo único**. O invariante final roda ao fim de todas as suítes: `assertAllWalletsConsistent` verifica saldo = Σledger, a cadeia de versões contínua e a versão final igual à da wallet.
 
 | Exigência do enunciado | Onde |
 |---|---|
@@ -565,6 +581,7 @@ São 215 testes. **Nenhum mock de PostgreSQL ou SQS**: integração e concorrên
 | 7. ROLLBACK/REFUND antes da referência | `outbox-and-references.test.ts` (+ orçamento esgotado e 3 workers concorrentes) |
 | 8. reinício com prova de consistência | `multi-instance.test.ts` #8 (SIGKILL em todas as instâncias no meio do tráfego e restart) |
 | Auditoria e `FAILED` (ADR-12) | `submission-failures.test.ts` (HTTP: payload inválido, conflito, wallet inexistente, reenvio corrigido; SQS: erro inesperado esgotado → `FAILED`, poison message; imutabilidade), `sqs-consumer.test.ts` (transitória esgotada → `RETRIES_EXHAUSTED`, sem `FAILED`) |
+| Multi-moeda | `currencies.test.ts` (HTTP e SQS reais: moedas habilitadas, `CURRENCY_NOT_SUPPORTED`, código não-ISO, uma wallet por moeda movimentando de forma independente, journal sem mistura de moedas, `CURRENCY_MISMATCH` persistido com replay e confirmado no SQS sem DLQ, reversão em outra moeda), `test/unit/config.test.ts` (lista validada no boot) |
 | Revisão de ponta a ponta | `hardening.test.ts` (UUID em maiúsculas vira a mesma requisição; chave de idempotência por provedor; `401`/`403`/escopos/`404` para transação de outro provedor com um adapter de identidade real; falha não atribuível não é gravada; CORS ausente), `wager-batch.test.ts` (UUID em lote; dependente de referência rejeitada acelerado), `schema-constraints.test.ts` (chave única por provedor) |
 | Lote por wallet (ADR-14) | `wager-batch.test.ts` (equivalência lote × sequencial, referência fora de ordem dentro do lote, lote com saldo líquido zero, `messageId` repetido, reentrega de lote inteiro, cenário obrigatório num lote, lotes concorrentes, referência de outra wallet), `sqs-batch.test.ts` (SQS real: N mensagens numa transação, poison no meio do grupo, fallback de wallet inexistente), `schema-constraints.test.ts` (salto de versão só com todas as linhas) |
 
@@ -582,6 +599,7 @@ Ferramentas de suporte:
 - **Contexto de trace na outbox.** O trace da requisição original não é gravado na outbox, então o span de publicação começa um trace novo. Próximo passo: adicionar uma coluna `traceparent`.
 - **Ordem entre publishers** é *best effort*. Os consumidores devem usar `walletVersion` e deduplicar por `eventId`.
 - **Testes de multi-processo e timing.** Uma execução isolada falhou no cenário #5 por mensagem residual de outro cenário. A causa foi corrigida com filas dedicadas, e depois disso foram 10 execuções seguidas sem falha. Como os testes dependem de tempo, um ambiente muito saturado pode aumentar a latência; os timeouts são generosos.
+- **Casas decimais por moeda.** Todas as moedas usam 2 casas (ADR-02). KWD/BHD (3 casas) não são representáveis, e JPY/CLP aceitariam centavos. Isso fica fora do escopo.
 - **Hot wallet no HTTP.** O lote só atua no SQS: no HTTP cada requisição é um lote de 1, e o teto continua sendo o tempo de lock. Juntar requisições HTTP da mesma wallet exigiria uma janela de espera e roteamento por wallet no load balancer; não foi feito.
 - **Lote e tráfego espalhado.** Com mensagens distribuídas por muitas wallets, cada receive traz ~1 mensagem por wallet e o lote não ajuda (ADR-14).
 - **Emulador.** Os números assíncronos no ambiente local refletem o MiniStack (Python, um core), não o SQS real.

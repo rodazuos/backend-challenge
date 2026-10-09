@@ -19,6 +19,7 @@ export function coreConfig(db: TestDatabase, overrides: Partial<CoreConfig> = {}
     PENDING_REF_MAX_ATTEMPTS: 3,
     PENDING_REF_BATCH_SIZE: 50,
     PENDING_REF_LEASE_MS: 5000,
+    SUPPORTED_CURRENCIES: ["BRL", "USD", "EUR"],
     ...overrides,
   };
 }

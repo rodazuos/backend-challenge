@@ -21,8 +21,9 @@ Serviço financeiro distribuído que processa transações de apostas (`BET`, `W
 - **Outbox transacional.** Publishers concorrentes coordenam o trabalho por lease (`SKIP LOCKED`). Um publisher que cai é substituído automaticamente quando a lease expira.
 - **Auditoria de recusas.** Toda submissão que não vira resultado de negócio (payload inválido, conflito, wallet inexistente, retries esgotados) fica registrada, emite um evento e é consultável pelo provedor, sem ocupar a chave de idempotência. Erros inesperados que esgotam as tentativas viram `FAILED` auditável.
 - **Lote por wallet no SQS.** As mensagens de uma mesma wallet chegadas juntas são aplicadas numa única transação SQL, com resultado idêntico ao processamento um a um (há teste de equivalência). Com tráfego concentrado, são 3,5× menos transações e +48% de vazão.
+- **Multi-moeda de verdade.** Um jogador tem uma wallet por moeda, as contrapartidas do journal são por moeda e as moedas habilitadas são configuração (`SUPPORTED_CURRENCIES`). Conflito de moeda vira rejeição de negócio (`CURRENCY_MISMATCH`), testada por HTTP e SQS reais. Todas as moedas usam 2 casas decimais.
 - **Segurança de ponta a ponta.** O nginx limita taxa e conexões por IP, corta clientes lentos e esconde os endpoints internos. Cada rota exige um escopo (nega por padrão), um provedor só enxerga as próprias transações e criar wallet é exclusivo do back-office. CORS desligado por decisão (API servidor a servidor). Detalhes em [ARCHITECTURE.md](ARCHITECTURE.md#7-segurança).
-- **Testes com infraestrutura real.** São 215 testes, com PostgreSQL e SQS reais. Incluem 3 processos Bun simultâneos, `SIGKILL` entre o commit e o ack, publishers que caem no meio do envio e restart com reconciliação final.
+- **Testes com infraestrutura real.** São 227 testes, com PostgreSQL e SQS reais. Incluem 3 processos Bun simultâneos, `SIGKILL` entre o commit e o ack, publishers que caem no meio do envio e restart com reconciliação final.
 
 ## Início rápido (stack completa)
 
@@ -116,6 +117,7 @@ Toda a configuração vem do ambiente e é validada com zod no boot. Exemplos es
 | `PENDING_REF_BASE_MS` · `PENDING_REF_MAX_MS` · `PENDING_REF_MAX_ATTEMPTS` | `2000` · `300000` · `10` | backoff de referências fora de ordem (~35 min) |
 | `SQS_BATCH_PER_WALLET` | `true` | aplica as mensagens de uma wallet de cada receive numa única transação SQL |
 | `SUBMISSION_FAILURE_RETENTION_DAYS` | `90` | retenção da auditoria de recusas |
+| `SUPPORTED_CURRENCIES` | `BRL,USD,EUR` | moedas em que wallets podem ser abertas (ISO-4217, validado no boot); outra moeda ISO responde `422 CURRENCY_NOT_SUPPORTED` |
 | `OTEL_ENABLED` | `false` | tracing OTLP (HTTP, PostgreSQL, SQS, outbox) |
 | `LB_RATE_LIMIT_RPS` · `LB_RATE_LIMIT_BURST` | `500` · `1000` | nginx: taxa por IP de cliente (acima disso, `429` com `Retry-After`) |
 | `LB_HEAVY_RATE_LIMIT_RPS` · `LB_HEAVY_RATE_LIMIT_BURST` | `10` · `20` | nginx: taxa extra por IP na reconciliação (endpoint caro) |

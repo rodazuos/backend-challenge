@@ -51,6 +51,16 @@ export class WalletNotFoundForSubmissionError extends ApplicationError {
   }
 }
 
+/** Wallet opening in a valid ISO-4217 currency the operator has not enabled (SUPPORTED_CURRENCIES). */
+export class CurrencyNotSupportedError extends ApplicationError {
+  readonly code = "CURRENCY_NOT_SUPPORTED";
+  readonly kind = "UNPROCESSABLE";
+
+  constructor(currency: string, supported: readonly string[]) {
+    super(`currency ${currency} is not enabled`, { currency, supported });
+  }
+}
+
 export class IdempotencyConflictError extends ApplicationError {
   readonly code = "IDEMPOTENCY_CONFLICT";
   readonly kind = "CONFLICT";

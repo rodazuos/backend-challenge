@@ -1,4 +1,8 @@
-import { NotFoundError, ValidationError } from "../../../shared/application/errors";
+import {
+  CurrencyNotSupportedError,
+  NotFoundError,
+  ValidationError,
+} from "../../../shared/application/errors";
 import type { AppLogger, AppMetrics } from "../../../shared/application/observability";
 import type { UnitOfWork } from "../../../shared/application/unit-of-work";
 import { DomainError } from "../../../shared/domain/domain-error";
@@ -39,11 +43,13 @@ export class CreateWallet {
     private readonly clock: Clock,
     private readonly ids: IdGenerator,
     private readonly logger: AppLogger,
+    /** Currencies in which wallets may be opened (SUPPORTED_CURRENCIES). */
+    private readonly supportedCurrencies: readonly string[],
   ) {}
 
   /**
-   * Opens a wallet. A positive initial balance is an internal OPENING transaction with its CREDIT ledger entry,
-   * committed in the same SQL transaction as the wallet row (plus its outbox events).
+   * Opens a wallet in one of the enabled currencies. A positive initial balance is an internal OPENING transaction
+   * with its CREDIT ledger entry, committed in the same SQL transaction as the wallet row (plus its outbox events).
    */
   async execute(cmd: {
     playerId: string;
@@ -58,6 +64,9 @@ export class CreateWallet {
     } catch (error) {
       if (error instanceof DomainError) throw new ValidationError(error.message, { field: "initialBalance" });
       throw error;
+    }
+    if (!this.supportedCurrencies.includes(initial.currency)) {
+      throw new CurrencyNotSupportedError(initial.currency, this.supportedCurrencies);
     }
 
     const view = await this.uow.transaction(

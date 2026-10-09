@@ -1,5 +1,6 @@
 import { hostname } from "node:os";
 import { z } from "zod";
+import { isIso4217 } from "../shared/domain/currency";
 
 const bool = z.enum(["true", "false", "1", "0"]).transform((v) => v === "true" || v === "1");
 const int = (def: number, min = 0) => z.coerce.number().int().min(min).default(def);
@@ -60,6 +61,23 @@ const EnvSchema = z.object({
   PENDING_REF_MAX_MS: int(300_000, 1),
   PENDING_REF_MAX_ATTEMPTS: int(10, 1),
   PENDING_REF_LEASE_MS: int(30_000, 100),
+
+  /** Currencies in which wallets may be opened (ISO-4217, comma separated). A typo fails the boot. */
+  SUPPORTED_CURRENCIES: z
+    .string()
+    .default("BRL,USD,EUR")
+    .transform((s) =>
+      s
+        .split(",")
+        .map((c) => c.trim())
+        .filter(Boolean),
+    )
+    .pipe(
+      z
+        .array(z.string().refine(isIso4217, "not an ISO-4217 currency code (upper case, e.g. BRL)"))
+        .min(1)
+        .transform((codes) => [...new Set(codes)]),
+    ),
 
   INBOX_RETENTION_DAYS: int(30, 1),
   SUBMISSION_FAILURE_RETENTION_DAYS: int(90, 1),

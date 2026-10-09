@@ -54,6 +54,7 @@ export type CoreConfig = Pick<
   | "PENDING_REF_MAX_ATTEMPTS"
   | "PENDING_REF_BATCH_SIZE"
   | "PENDING_REF_LEASE_MS"
+  | "SUPPORTED_CURRENCIES"
 >;
 
 export async function buildCore(
@@ -104,7 +105,7 @@ export async function buildCore(
         leaseMs: config.PENDING_REF_LEASE_MS,
       },
     ),
-    createWallet: new CreateWallet(uow, clock, ids, deps.logger),
+    createWallet: new CreateWallet(uow, clock, ids, deps.logger, config.SUPPORTED_CURRENCIES),
     getWallet: new GetWallet(uow),
     listLedger: new ListWalletLedger(uow),
     reconcileWallet: new ReconcileWallet(uow, clock, deps.metrics, deps.logger),
