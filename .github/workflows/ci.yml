@@ -18,9 +18,9 @@ concurrency:
 jobs:
   quality:
     name: lint · typecheck · money-safety · unit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # pinned: reproducible CI (ubuntu-latest moves to 26 on 2026-10-19)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5 # Node 24 runtime (v4 targets the deprecated Node 20)
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
@@ -33,10 +33,10 @@ jobs:
   integration:
     name: integration · concurrency (real PostgreSQL + SQS)
     needs: quality
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # pinned: reproducible CI (ubuntu-latest moves to 26 on 2026-10-19)
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5 # Node 24 runtime (v4 targets the deprecated Node 20)
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
@@ -52,10 +52,10 @@ jobs:
   docker:
     name: docker image + compose smoke test
     needs: quality
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # pinned: reproducible CI (ubuntu-latest moves to 26 on 2026-10-19)
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5 # Node 24 runtime (v4 targets the deprecated Node 20)
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
