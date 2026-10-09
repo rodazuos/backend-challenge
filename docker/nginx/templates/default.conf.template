@@ -65,9 +65,9 @@ server {
     return 405 '{"code":"METHOD_NOT_ALLOWED","message":"method not allowed"}';
   }
 
-  # Internal-only endpoints: Prometheus and orchestrator probes reach the replicas directly on the internal network.
-  location = /metrics      { return 404 '{"code":"NOT_FOUND","message":"not found"}'; }
-  location = /health/ready { return 404 '{"code":"NOT_FOUND","message":"not found"}'; }
+  # Internal-only: Prometheus scrapes the replicas directly on the internal network. The health endpoints stay public
+  # (required by the challenge, unauthenticated); readiness only reports ok/unavailable per dependency, no raw errors.
+  location = /metrics { return 404 '{"code":"NOT_FOUND","message":"not found"}'; }
 
   # Expensive endpoint (full ledger scan): its own, much smaller budget on top of the general one.
   location ~ ^/wallets/[^/]+/reconciliation$ {

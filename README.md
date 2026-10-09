@@ -23,7 +23,7 @@ Serviço financeiro distribuído que processa transações de apostas (`BET`, `W
 - **Lote por wallet no SQS.** As mensagens de uma mesma wallet chegadas juntas são aplicadas numa única transação SQL, com resultado idêntico ao processamento um a um (há teste de equivalência). Com tráfego concentrado, são 3,5× menos transações e +48% de vazão.
 - **Multi-moeda de verdade.** Um jogador tem uma wallet por moeda, as contrapartidas do journal são por moeda e as moedas habilitadas são configuração (`SUPPORTED_CURRENCIES`). Conflito de moeda vira rejeição de negócio (`CURRENCY_MISMATCH`), testada por HTTP e SQS reais. Todas as moedas usam 2 casas decimais.
 - **Segurança de ponta a ponta.** O nginx limita taxa e conexões por IP, corta clientes lentos e esconde os endpoints internos. Cada rota exige um escopo (nega por padrão), um provedor só enxerga as próprias transações e criar wallet é exclusivo do back-office. CORS desligado por decisão (API servidor a servidor). Detalhes em [ARCHITECTURE.md](ARCHITECTURE.md#7-segurança).
-- **Testes com infraestrutura real.** São 227 testes, com PostgreSQL e SQS reais. Incluem 3 processos Bun simultâneos, `SIGKILL` entre o commit e o ack, publishers que caem no meio do envio e restart com reconciliação final.
+- **Testes com infraestrutura real.** São 229 testes, com PostgreSQL e SQS reais. Incluem 3 processos Bun simultâneos, `SIGKILL` entre o commit e o ack, publishers que caem no meio do envio e restart com reconciliação final.
 
 ## Início rápido (stack completa)
 
@@ -36,7 +36,7 @@ docker compose up -d --build
 Esse comando sobe:
 - PostgreSQL e MiniStack (SQS);
 - um job de bootstrap, que roda as migrations e cria as filas, a DLQ e a redrive policy;
-- **3 réplicas** da aplicação atrás de um nginx em `http://localhost:8080`, que é a borda: rate limit por IP (429), timeouts contra clientes lentos, e `/metrics` e `/health/ready` só na rede interna.
+- **3 réplicas** da aplicação atrás de um nginx em `http://localhost:8080`, que é a borda: rate limit por IP (429), timeouts contra clientes lentos, e `/metrics` só na rede interna. Os health checks (`/health/live`, `/health/ready`) ficam públicos, como pede o enunciado.
 
 ```bash
 bun install
@@ -90,7 +90,7 @@ Todas as respostas de erro usam `{ code, message, details?, correlationId }`. A 
 | `GET /wagering/transactions/:transactionId` | `wagers:read` | consulta por id interno (transação de outro provedor responde `404`) |
 | `GET /providers/:providerId/wagering/transactions/:externalTransactionId` | `wagers:read` | consulta por id do provedor |
 | `GET /providers/:providerId/wagering/transactions/:externalTransactionId/failures` | `wagers:read` | recusas auditadas dessa transação (motivo, categoria, se é `retryable`), mais recentes primeiro |
-| `GET /health/live` · `GET /health/ready` · `GET /metrics` | público | liveness, readiness (PostgreSQL + SQS) e Prometheus; ready e metrics não passam pela borda |
+| `GET /health/live` · `GET /health/ready` · `GET /metrics` | público | liveness, readiness (PostgreSQL + SQS, só `ok`/`unavailable` por dependência, sem detalhes internos) e Prometheus; `/metrics` não passa pela borda |
 
 A autenticação é um ponto de extensão: o adapter atual (no-op) concede todos os escopos. Os escopos e a regra "provedor só atua sobre o próprio `providerId`" já são aplicados pelo guard global e estão testados com um adapter de identidade real (ADR-09).
 

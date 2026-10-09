@@ -216,7 +216,7 @@ Autenticação não pontua, então o tempo foi para correção. Existe `Provider
   - `outbox_lag_seconds` (idade do evento mais antigo não publicado), `outbox_publish_lag_seconds` (commit → broker), `outbox_pending_messages`;
   - `wager_processing_duration_seconds`, `pending_reference_transactions`, `reconciliation_mismatches_total`;
   - `wager_submission_failures_total{channel,reason}` (auditoria, ADR-12).
-- **Health:** `live` é só o processo, porque uma queda do banco não deve reiniciar pods. `ready` checa PostgreSQL e SQS com timeout e cache de 2 s, e responde 503 durante o shutdown.
+- **Health:** `live` é só o processo, porque uma queda do banco não deve reiniciar pods. `ready` checa PostgreSQL e SQS com timeout e cache de 2 s, e responde 503 durante o shutdown. É público (o enunciado exige health sem autenticação) e passa pela borda, por isso o corpo só diz `ok` ou `unavailable` por dependência: o erro do driver, que pode citar host, porta ou usuário internos, vai só para o log.
 - **Tracing:** OpenTelemetry via `--preload`. Inclui auto-instrumentação de HTTP e `pg` (validada no Bun) e spans manuais de consumo SQS e outbox. O W3C trace context é propagado em atributos SQS. Fica desligado por padrão.
 - **Dashboard** Grafana provisionado com 14 painéis: lag, DLQ, latência p50/p95/p99, idempotência, locks, outbox e event loop.
 
@@ -491,7 +491,7 @@ Visão de ponta a ponta, da borda ao banco. Cada camada assume que a anterior po
 | Timeouts de header, body e envio | 10 s | *slowloris* e clientes lentos |
 | Corpo e headers | 32 kB / 4×8 kB | payloads gigantes |
 | Métodos | só GET, HEAD e POST (o resto é `405`) | superfície desnecessária |
-| `/metrics` e `/health/ready` | `404` na borda | vazamento de dados internos (o Prometheus e as probes acessam as réplicas pela rede interna) |
+| `/metrics` | `404` na borda | vazamento de dados internos (o Prometheus acessa as réplicas pela rede interna) |
 | `X-Forwarded-For` | sobrescrito com o IP real | IP de origem forjado pelo cliente |
 | `server_tokens off` | — | fingerprint de versão |
 
@@ -561,7 +561,7 @@ Visão de ponta a ponta, da borda ao banco. Cada camada assume que a anterior po
 
 ## 9. Estratégia de testes
 
-São 227 testes. **Nenhum mock de PostgreSQL ou SQS**: integração e concorrência rodam contra PostgreSQL 17 e MiniStack reais (`docker-compose.test.yml`). Cada suíte usa um **banco isolado**, clonado de um template migrado (`CREATE DATABASE … TEMPLATE`), e **filas com sufixo único**. O invariante final roda ao fim de todas as suítes: `assertAllWalletsConsistent` verifica saldo = Σledger, a cadeia de versões contínua e a versão final igual à da wallet.
+São 229 testes. **Nenhum mock de PostgreSQL ou SQS**: integração e concorrência rodam contra PostgreSQL 17 e MiniStack reais (`docker-compose.test.yml`). Cada suíte usa um **banco isolado**, clonado de um template migrado (`CREATE DATABASE … TEMPLATE`), e **filas com sufixo único**. O invariante final roda ao fim de todas as suítes: `assertAllWalletsConsistent` verifica saldo = Σledger, a cadeia de versões contínua e a versão final igual à da wallet.
 
 | Exigência do enunciado | Onde |
 |---|---|
@@ -582,7 +582,7 @@ São 227 testes. **Nenhum mock de PostgreSQL ou SQS**: integração e concorrên
 | 8. reinício com prova de consistência | `multi-instance.test.ts` #8 (SIGKILL em todas as instâncias no meio do tráfego e restart) |
 | Auditoria e `FAILED` (ADR-12) | `submission-failures.test.ts` (HTTP: payload inválido, conflito, wallet inexistente, reenvio corrigido; SQS: erro inesperado esgotado → `FAILED`, poison message; imutabilidade), `sqs-consumer.test.ts` (transitória esgotada → `RETRIES_EXHAUSTED`, sem `FAILED`) |
 | Multi-moeda | `currencies.test.ts` (HTTP e SQS reais: moedas habilitadas, `CURRENCY_NOT_SUPPORTED`, código não-ISO, uma wallet por moeda movimentando de forma independente, journal sem mistura de moedas, `CURRENCY_MISMATCH` persistido com replay e confirmado no SQS sem DLQ, reversão em outra moeda), `test/unit/config.test.ts` (lista validada no boot) |
-| Revisão de ponta a ponta | `hardening.test.ts` (UUID em maiúsculas vira a mesma requisição; chave de idempotência por provedor; `401`/`403`/escopos/`404` para transação de outro provedor com um adapter de identidade real; falha não atribuível não é gravada; CORS ausente), `wager-batch.test.ts` (UUID em lote; dependente de referência rejeitada acelerado), `schema-constraints.test.ts` (chave única por provedor) |
+| Revisão de ponta a ponta | `hardening.test.ts` (UUID em maiúsculas vira a mesma requisição; chave de idempotência por provedor; `401`/`403`/escopos/`404` para transação de outro provedor com um adapter de identidade real; falha não atribuível não é gravada; CORS ausente), `wager-batch.test.ts` (UUID em lote; dependente de referência rejeitada acelerado), `schema-constraints.test.ts` (chave única por provedor), `test/unit/readiness.test.ts` (readiness pública sem erro interno no corpo) |
 | Lote por wallet (ADR-14) | `wager-batch.test.ts` (equivalência lote × sequencial, referência fora de ordem dentro do lote, lote com saldo líquido zero, `messageId` repetido, reentrega de lote inteiro, cenário obrigatório num lote, lotes concorrentes, referência de outra wallet), `sqs-batch.test.ts` (SQS real: N mensagens numa transação, poison no meio do grupo, fallback de wallet inexistente), `schema-constraints.test.ts` (salto de versão só com todas as linhas) |
 
 Ferramentas de suporte:

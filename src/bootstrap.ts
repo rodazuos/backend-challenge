@@ -65,15 +65,18 @@ export async function startApplication(
   const faults = new FaultInjector(config.FAULT_INJECTION);
   if (faults.enabled) logger.warn({ faults: config.FAULT_INJECTION }, "FAULT INJECTION ENABLED (test only)");
 
-  const readiness = new ReadinessService([
-    {
-      name: "postgres",
-      check: async (timeoutMs) => {
-        await withTimeout(core.orm.em.fork().execute("SELECT 1"), timeoutMs, "postgres");
+  const readiness = new ReadinessService(
+    [
+      {
+        name: "postgres",
+        check: async (timeoutMs) => {
+          await withTimeout(core.orm.em.fork().execute("SELECT 1"), timeoutMs, "postgres");
+        },
       },
-    },
-    { name: "sqs", check: (timeoutMs) => sqs.ping(timeoutMs) },
-  ]);
+      { name: "sqs", check: (timeoutMs) => sqs.ping(timeoutMs) },
+    ],
+    logger,
+  );
   metrics.registerGauges({
     outboxStats: () =>
       core.uow.snapshot((s) => s.outbox.stats(), { label: "metrics-outbox", retryTransient: false }),

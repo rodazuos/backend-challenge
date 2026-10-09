@@ -1,6 +1,7 @@
 import { Controller, Get, HttpStatus, Res } from "@nestjs/common";
 import type { Response } from "express";
 import { Public } from "../../modules/auth/provider-auth";
+import type { AppLogger } from "../../shared/application/observability";
 import { PromMetrics } from "../observability/metrics";
 
 export interface DependencyCheck {
@@ -10,12 +11,17 @@ export interface DependencyCheck {
 
 export interface ReadinessReport {
   status: "ready" | "not_ready";
-  checks: Record<string, { ok: boolean; latencyMs: number; error?: string }>;
+  /** `error` only ever carries a fixed, non-sensitive reason ("unavailable", "draining"). */
+  checks: Record<string, { ok: boolean; latencyMs: number; error?: "unavailable" | "draining" }>;
 }
 
 /**
  * Readiness = PostgreSQL and SQS reachable and the process is not draining. Results are cached briefly so
  * aggressive probes cannot turn into load on the dependencies.
+ *
+ * The endpoint is public (the challenge requires it unauthenticated, and it is reachable through the edge), so the
+ * body never carries raw driver errors — they can name internal hosts, ports or users. The real error goes to the
+ * log, where operators look anyway.
  */
 export class ReadinessService {
   private draining = false;
@@ -23,6 +29,7 @@ export class ReadinessService {
 
   constructor(
     private readonly checks: readonly DependencyCheck[],
+    private readonly logger?: AppLogger,
     private readonly options = { timeoutMs: 1500, cacheMs: 2000 },
   ) {}
 
@@ -48,10 +55,10 @@ export class ReadinessService {
           await c.check(this.options.timeoutMs);
           return [c.name, { ok: true, latencyMs: Math.round(performance.now() - started) }] as const;
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
+          this.logger?.warn({ err: error, dependency: c.name }, "readiness check failed");
           return [
             c.name,
-            { ok: false, latencyMs: Math.round(performance.now() - started), error: message.slice(0, 200) },
+            { ok: false, latencyMs: Math.round(performance.now() - started), error: "unavailable" as const },
           ] as const;
         }
       }),

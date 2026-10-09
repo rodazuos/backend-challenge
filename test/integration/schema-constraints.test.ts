@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { runMigrations } from "../../src/infrastructure/database/migrate";
 import { MIGRATIONS } from "../../src/infrastructure/database/migrations";
+import { assertAllWalletsConsistent } from "../helpers/invariants";
 import { createTestDatabase, type TestDatabase } from "../helpers/test-db";
 
 /**
@@ -12,6 +13,7 @@ beforeAll(async () => {
   db = await createTestDatabase();
 });
 afterAll(async () => {
+  await assertAllWalletsConsistent(db);
   await db.drop();
 });
 
