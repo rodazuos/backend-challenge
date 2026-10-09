@@ -17,11 +17,12 @@ Serviço financeiro distribuído que processa transações de apostas (`BET`, `W
   - transações terminais imutáveis;
   - journal de partidas dobradas balanceado.
 - **Concorrência por wallet.** Usa `SELECT … FOR UPDATE` por wallet, com `version` como defesa em profundidade. Não há lock global e não há deadlock entre wallets.
-- **Idempotência persistente.** A chave de idempotência e o par (provider, externalId) são únicos no banco. Há inbox por `(consumer, messageId)` para SQS, e o replay devolve o resultado original.
+- **Idempotência persistente.** A chave de idempotência e o externalId são únicos no banco **por provedor** (nenhum provedor vê, repete ou bloqueia as chaves de outro). Há inbox por `(consumer, messageId)` para SQS, e o replay devolve o resultado original.
 - **Outbox transacional.** Publishers concorrentes coordenam o trabalho por lease (`SKIP LOCKED`). Um publisher que cai é substituído automaticamente quando a lease expira.
 - **Auditoria de recusas.** Toda submissão que não vira resultado de negócio (payload inválido, conflito, wallet inexistente, retries esgotados) fica registrada, emite um evento e é consultável pelo provedor, sem ocupar a chave de idempotência. Erros inesperados que esgotam as tentativas viram `FAILED` auditável.
 - **Lote por wallet no SQS.** As mensagens de uma mesma wallet chegadas juntas são aplicadas numa única transação SQL, com resultado idêntico ao processamento um a um (há teste de equivalência). Com tráfego concentrado, são 3,5× menos transações e +48% de vazão.
-- **Testes com infraestrutura real.** São 204 testes, com PostgreSQL e SQS reais. Incluem 3 processos Bun simultâneos, `SIGKILL` entre o commit e o ack, publishers que caem no meio do envio e restart com reconciliação final.
+- **Segurança de ponta a ponta.** O nginx limita taxa e conexões por IP, corta clientes lentos e esconde os endpoints internos. Cada rota exige um escopo (nega por padrão), um provedor só enxerga as próprias transações e criar wallet é exclusivo do back-office. CORS desligado por decisão (API servidor a servidor). Detalhes em [ARCHITECTURE.md](ARCHITECTURE.md#7-segurança).
+- **Testes com infraestrutura real.** São 215 testes, com PostgreSQL e SQS reais. Incluem 3 processos Bun simultâneos, `SIGKILL` entre o commit e o ack, publishers que caem no meio do envio e restart com reconciliação final.
 
 ## Início rápido (stack completa)
 
@@ -34,7 +35,7 @@ docker compose up -d --build
 Esse comando sobe:
 - PostgreSQL e MiniStack (SQS);
 - um job de bootstrap, que roda as migrations e cria as filas, a DLQ e a redrive policy;
-- **3 réplicas** da aplicação atrás de um nginx em `http://localhost:8080`.
+- **3 réplicas** da aplicação atrás de um nginx em `http://localhost:8080`, que é a borda: rate limit por IP (429), timeouts contra clientes lentos, e `/metrics` e `/health/ready` só na rede interna.
 
 ```bash
 bun install
@@ -78,17 +79,19 @@ bun run dev                      # http://localhost:3000
 
 Todas as respostas de erro usam `{ code, message, details?, correlationId }`. A tabela completa de status está no [ARCHITECTURE.md](ARCHITECTURE.md#mapeamento-http).
 
-| Método e rota | Descrição |
-|---|---|
-| `POST /wallets` | cria a wallet; saldo inicial > 0 gera transação `OPENING` + `CREDIT` na mesma transação SQL |
-| `GET /wallets/:walletId` | saldo e versão |
-| `GET /wallets/:walletId/ledger?cursor=&limit=50` | ledger paginado (cursor opaco e estável, ordem por versão desc) |
-| `POST /wallets/:walletId/reconciliation` | recalcula o saldo pelo ledger e pelo journal; divergência é logada, contada e reportada, nunca corrigida |
-| `POST /wagering/transactions` | submete uma transação (header `Idempotency-Key` obrigatório) |
-| `GET /wagering/transactions/:transactionId` | consulta por id interno |
-| `GET /providers/:providerId/wagering/transactions/:externalTransactionId` | consulta por id do provedor |
-| `GET /providers/:providerId/wagering/transactions/:externalTransactionId/failures` | recusas auditadas dessa transação (motivo, categoria, se é `retryable`), mais recentes primeiro |
-| `GET /health/live` · `GET /health/ready` · `GET /metrics` | liveness, readiness (PostgreSQL + SQS) e Prometheus; sem autenticação |
+| Método e rota | Escopo | Descrição |
+|---|---|---|
+| `POST /wallets` | `wallets:manage` | cria a wallet; saldo inicial > 0 gera transação `OPENING` + `CREDIT` na mesma transação SQL |
+| `GET /wallets/:walletId` | `wallets:read` | saldo e versão |
+| `GET /wallets/:walletId/ledger?cursor=&limit=50` | `wallets:read` | ledger paginado (cursor opaco e estável, ordem por versão desc) |
+| `POST /wallets/:walletId/reconciliation` | `wallets:manage` | recalcula o saldo pelo ledger e pelo journal; divergência é logada, contada e reportada, nunca corrigida |
+| `POST /wagering/transactions` | `wagers:submit` | submete uma transação (header `Idempotency-Key` obrigatório) |
+| `GET /wagering/transactions/:transactionId` | `wagers:read` | consulta por id interno (transação de outro provedor responde `404`) |
+| `GET /providers/:providerId/wagering/transactions/:externalTransactionId` | `wagers:read` | consulta por id do provedor |
+| `GET /providers/:providerId/wagering/transactions/:externalTransactionId/failures` | `wagers:read` | recusas auditadas dessa transação (motivo, categoria, se é `retryable`), mais recentes primeiro |
+| `GET /health/live` · `GET /health/ready` · `GET /metrics` | público | liveness, readiness (PostgreSQL + SQS) e Prometheus; ready e metrics não passam pela borda |
+
+A autenticação é um ponto de extensão: o adapter atual (no-op) concede todos os escopos. Os escopos e a regra "provedor só atua sobre o próprio `providerId`" já são aplicados pelo guard global e estão testados com um adapter de identidade real (ADR-09).
 
 ```bash
 curl -s -X POST localhost:8080/wagering/transactions \
@@ -114,6 +117,15 @@ Toda a configuração vem do ambiente e é validada com zod no boot. Exemplos es
 | `SQS_BATCH_PER_WALLET` | `true` | aplica as mensagens de uma wallet de cada receive numa única transação SQL |
 | `SUBMISSION_FAILURE_RETENTION_DAYS` | `90` | retenção da auditoria de recusas |
 | `OTEL_ENABLED` | `false` | tracing OTLP (HTTP, PostgreSQL, SQS, outbox) |
+| `LB_RATE_LIMIT_RPS` · `LB_RATE_LIMIT_BURST` | `500` · `1000` | nginx: taxa por IP de cliente (acima disso, `429` com `Retry-After`) |
+| `LB_HEAVY_RATE_LIMIT_RPS` · `LB_HEAVY_RATE_LIMIT_BURST` | `10` · `20` | nginx: taxa extra por IP na reconciliação (endpoint caro) |
+| `LB_MAX_CONN_PER_IP` | `256` | nginx: conexões simultâneas por IP |
+
+Benchmarks feitos de uma única máquina podem precisar de limites maiores na borda, por exemplo:
+
+```bash
+LB_RATE_LIMIT_RPS=100000 LB_RATE_LIMIT_BURST=100000 docker compose up -d lb
+```
 
 ## Estrutura
 

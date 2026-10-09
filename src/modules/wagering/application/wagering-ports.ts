@@ -6,6 +6,12 @@ export interface ExternalRef {
   externalTransactionId: string;
 }
 
+/** Idempotency keys are unique per provider (provider_id, idempotency_key). */
+export interface IdempotencyRef {
+  providerId: string;
+  idempotencyKey: string;
+}
+
 export interface ClaimedPendingReference {
   id: string;
   walletId: string;
@@ -13,8 +19,7 @@ export interface ClaimedPendingReference {
 
 export interface WagerTransactionRepository {
   findById(id: string): Promise<WagerTransaction | undefined>;
-  findByIdempotencyKey(key: string): Promise<WagerTransaction | undefined>;
-  /** Single round trip for both uniqueness keys: by idempotency key and by (providerId, externalTransactionId). */
+  /** Single round trip for both uniqueness keys, both scoped to the provider: idempotency key and external id. */
   findIdempotencyCandidates(
     idempotencyKey: string,
     providerId: string,
@@ -28,9 +33,9 @@ export interface WagerTransactionRepository {
   lockById(id: string): Promise<WagerTransaction | undefined>;
   /** Multi-row insert (a unique violation on an idempotency constraint surfaces as a retryable race). */
   insertMany(txs: readonly WagerTransaction[]): Promise<void>;
-  /** One query for every idempotency key and every (provider, external id) of a batch. */
+  /** One query for every (provider, idempotency key) and every (provider, external id) of a batch. */
   findIdempotencyCandidatesMany(
-    keys: readonly string[],
+    keys: readonly IdempotencyRef[],
     pairs: readonly ExternalRef[],
   ): Promise<WagerTransaction[]>;
   findByProviderExternalIds(pairs: readonly ExternalRef[]): Promise<WagerTransaction[]>;
@@ -42,7 +47,7 @@ export interface WagerTransactionRepository {
   update(tx: WagerTransaction): Promise<void>;
   /** True when a PROCESSED REFUND/ROLLBACK already references `transactionId`. */
   isReversed(transactionId: string): Promise<boolean>;
-  /** Makes PENDING_REFERENCE dependents of a just-processed transaction due now (same wallet only). */
+  /** Makes PENDING_REFERENCE dependents of a transaction that just became terminal due now (same wallet only). */
   nudgeDependents(
     walletId: string,
     providerId: string,

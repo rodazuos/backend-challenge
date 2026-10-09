@@ -380,14 +380,28 @@ describe("double-entry journal", () => {
 });
 
 describe("wager transactions", () => {
-  test("idempotency key and (provider, externalId) are unique", async () => {
+  const pendingBet = `INSERT INTO wager_transactions (id, provider_id, external_transaction_id, idempotency_key,
+       payload_hash, wallet_id, player_id, round_id, game_id, kind, amount, currency, status, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'r', 'g', 'BET', 1, 'BRL', 'PENDING', now())`;
+
+  test("idempotency key and (provider, externalId) are unique per provider", async () => {
     const w = await seedWallet();
     await expectRejected(
-      `INSERT INTO wager_transactions (id, provider_id, external_transaction_id, idempotency_key, payload_hash, wallet_id,
-         player_id, round_id, game_id, kind, amount, currency, status, created_at)
-       VALUES ($1, 'system', 'x', $2, $3, $4, $5, 'r', 'g', 'BET', 1, 'BRL', 'PENDING', now())`,
-      [uuid(), `system:opening:${w.walletId}`, HASH, w.walletId, w.playerId],
-      /wager_tx_idempotency_key_uk/,
+      pendingBet,
+      [uuid(), "system", "x", `system:opening:${w.walletId}`, HASH, w.walletId, w.playerId],
+      /wager_tx_provider_idempotency_uk/,
+    );
+  });
+
+  test("two providers may use the same idempotency key (each provider owns its key space)", async () => {
+    const w = await seedWallet();
+    const key = `shared-${uuid()}`;
+    await db.query(pendingBet, [uuid(), "provider-a", uuid(), key, HASH, w.walletId, w.playerId]);
+    await db.query(pendingBet, [uuid(), "provider-b", uuid(), key, HASH, w.walletId, w.playerId]);
+    await expectRejected(
+      pendingBet,
+      [uuid(), "provider-a", uuid(), key, HASH, w.walletId, w.playerId],
+      /wager_tx_provider_idempotency_uk/,
     );
   });
 

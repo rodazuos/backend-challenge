@@ -89,7 +89,13 @@ O Nest é só a casca HTTP/DI. O núcleo é montado sem framework em `src/compos
 
 ### ADR-04 — Idempotência persistente
 
-- **A fonte da verdade é o banco.** `UNIQUE(idempotency_key)` e `UNIQUE(provider_id, external_transaction_id)` em `wager_transactions`. Um cache em memória nunca participa da decisão.
+- **A fonte da verdade é o banco.** `UNIQUE(provider_id, idempotency_key)` e `UNIQUE(provider_id, external_transaction_id)` em `wager_transactions`. Um cache em memória nunca participa da decisão.
+- **Cada provedor tem o próprio espaço de chaves.** Na primeira versão a chave era única no sistema inteiro. A revisão de ponta a ponta mostrou dois problemas:
+  - o provider B que reusasse uma chave do provider A recebia `409` com o `transactionId` do A no detalhe (vazamento entre provedores);
+  - qualquer provedor podia "ocupar" chaves que outro usaria depois.
+
+  A migration `Migration20261012000001ProviderScopedIdempotency` troca a constraint, e todas as buscas passam a ser por (provider, chave). O `down` recria a constraint global e falha se dois provedores já compartilharem uma chave, de propósito: um rollback nunca deve fundir submissões de provedores diferentes.
+- **UUIDs normalizados para minúsculas na borda**, antes do hash, e de novo no use case como defesa. O PostgreSQL devolve UUIDs em minúsculas e o domínio compara ids como texto. Sem isso, um `walletId` em maiúsculas virava `500` (ou `FAILED` no SQS), e um `playerId` em maiúsculas virava uma rejeição terminal `WALLET_PLAYER_MISMATCH`, presa à chave de idempotência. Agora as duas grafias são a mesma requisição (replay).
 - **Avaliação após o lock da wallet.** Duplicatas concorrentes da mesma operação ficam na fila do lock. A segunda vê a primeira já commitada e responde com replay. Uma única query cobre as duas chaves.
 - **Replay devolve o resultado original**, inclusive o saldo observado naquele momento (`result_balance_amount`), com `idempotentReplay: true` e o header `Idempotent-Replayed: true`.
 - **Mesma chave com payload diferente** gera `409 IDEMPOTENCY_CONFLICT` (`PAYLOAD_MISMATCH`). Mesmo `(provider, externalId)` com outra chave gera `EXTERNAL_ID_REUSED`.
@@ -112,7 +118,9 @@ O Nest é só a casca HTTP/DI. O núcleo é montado sem framework em `src/compos
   - processa cada item na sua própria transação, travando wallet → transação;
   - usa backoff exponencial `2s·2ⁿ` com jitter e teto de 5 min.
 - **Orçamento: 10 tentativas (~35 min).** Provedores enviam a operação referenciada em segundos ou minutos. Um orçamento maior prenderia dinheiro "no limbo" e atrasaria a resposta definitiva ao provedor. Esgotado o orçamento, a transação vira `REJECTED(REFERENCE_NOT_FOUND)` e o evento correspondente é publicado.
-- **Nudge:** quando a referência chega e é processada, a mesma transação SQL marca os dependentes da mesma wallet como devidos *agora*. A latência de resolução cai de "próximo backoff" para "próximo poll" (~1 s). O worker continua sendo a garantia.
+- **Nudge:** quando a referência chega e fica **terminal**, a mesma transação SQL marca os dependentes da mesma wallet como devidos *agora*. A latência de resolução cai de "próximo backoff" para "próximo poll" (~1 s). O worker continua sendo a garantia.
+  - `PROCESSED` libera os dependentes.
+  - `REJECTED` ou `FAILED` faz com que eles virem `REFERENCE_NOT_PROCESSED` imediatamente. Antes, só `PROCESSED` acelerava, e o dependente de uma referência rejeitada esperava o próprio backoff (até 5 min) para receber a mesma resposta.
 
 ### ADR-06 — Transactional outbox
 
@@ -136,7 +144,8 @@ O Nest é só a casca HTTP/DI. O núcleo é montado sem framework em `src/compos
   - **permanente** (JSON inválido, schema inválido, conflito de idempotência, wallet inexistente): auditoria, envio explícito à DLQ com atributo `failureReason` e delete.
 - Toda mensagem que vai para a DLQ deixa uma linha de auditoria e um evento `WagerSubmissionFailed`. A redrive policy continua como rede de segurança para mensagens que derrubam o próprio consumidor.
 - Mensagens do mesmo `MessageGroupId` (wallet) num mesmo receive são aplicadas **em lote, numa única transação SQL e na ordem de chegada** (ADR-14), com ack em lote depois do COMMIT. Grupos diferentes rodam em paralelo. O FIFO do broker é otimização de ordem, não garantia de consistência.
-- Há um heartbeat de visibilidade para processamentos longos.
+- **Heartbeat de visibilidade desde o receive até o settle**, por mensagem. Isso inclui as que esperam a vez atrás de outras do mesmo grupo ou no fallback do lote. Assim, um grupo lento nunca deixa uma mensagem ainda em posse da instância reaparecer na fila. No shutdown, o heartbeat é parado antes de a mensagem ser devolvida com `visibility = 0`.
+- O inbox de um lote é inserido em ordem de `messageId`. Dois lotes que compartilham mensagens podem esperar um pelo outro, mas não entram em deadlock.
 - **`SIGTERM`:**
   1. a readiness passa a 503;
   2. o polling para (o long poll é abortado);
@@ -158,16 +167,27 @@ O Nest é só a casca HTTP/DI. O núcleo é montado sem framework em `src/compos
 
 ### ADR-09 — Autenticação: ponto de extensão, não implementação
 
-Autenticação não pontua, então o tempo foi para correção. Existe `ProviderIdentityPort`, implementado por `NoopProviderIdentity`, e o `ProviderAuthGuard` é **global e real**:
-- resolve o principal;
+Autenticação não pontua, então o tempo foi para correção. Existe `ProviderIdentityPort`, implementado por `NoopProviderIdentity`. A **autenticação** é o ponto de extensão; a **autorização** é real e está testada com um adapter de identidade de teste (`hardening.test.ts`). O `ProviderAuthGuard` é **global**:
+- resolve o principal (`providerId`, `subject`, `scopes`); sem credencial, responde `401`;
 - marca health e metrics como `@Public()`;
-- aplica autorização, garantindo que um provider só atua sobre o próprio `providerId`. O adapter no-op devolve um principal `*` confiável.
+- **exige um escopo por rota e nega por padrão**: uma rota nova sem `@RequireScope` responde `403`, nunca fica aberta por esquecimento;
+- garante que um provider só atua sobre o próprio `providerId` (body ou path);
+- o adapter no-op devolve um principal `*` confiável, com todos os escopos.
+
+| Escopo | Rotas | Quem recebe |
+|---|---|---|
+| `wagers:submit` | `POST /wagering/transactions` | provedor |
+| `wagers:read` | `GET /wagering/transactions/:id`, `GET /providers/:p/...` (transação e falhas) | provedor |
+| `wallets:read` | `GET /wallets/:id`, `GET /wallets/:id/ledger` | back-office (ou um agregador confiável) |
+| `wallets:manage` | `POST /wallets` (o saldo de abertura **cria dinheiro**), `POST /wallets/:id/reconciliation` | back-office |
+
+**Propriedade do recurso.** Em `GET /wagering/transactions/:id`, uma transação de outro provedor responde `404`, igual a uma inexistente: ids não podem ser sondados. A wallet não pertence a um provedor (o jogador joga em vários), por isso o acesso a ela é controlado por escopo, não por dono. Restringir a leitura de saldo ao jogador da sessão exigiria o *launch token* do jogo, fora do escopo.
 
 **Desenho de produção (Keycloak ou Zitadel):**
 - cada provedor é um *client* OIDC com `client_credentials`;
 - um `JwtProviderIdentity` valida o bearer via JWKS do IdP (com cache e rotação), checando `iss`, `aud` e `exp`;
-- ele mapeia a claim `provider_id` para o principal;
-- o guard já impõe `principal.providerId === body.providerId`;
+- ele mapeia a claim `provider_id` e o `scope` do token para o principal;
+- o guard já impõe os escopos e `principal.providerId === body.providerId`;
 - mensagens SQS são canal interno confiável (escopo do enunciado), mas a identidade do provedor na mensagem continua sujeita às mesmas validações de domínio.
 
 ### ADR-10 — Observabilidade
@@ -217,6 +237,7 @@ Há uma ressalva: em envios deduplicados, o MiniStack devolve o MD5 da mensagem 
    - Cada registro gera, na mesma transação, o evento **`WagerSubmissionFailed`** via outbox. É assim que um provedor do canal SQS fica sabendo da recusa.
    - O provedor consulta em `GET /providers/:providerId/wagering/transactions/:externalTransactionId/failures`.
    - Falhas transitórias no **HTTP** (503) não são auditadas: o cliente já recebeu a resposta síncrona com `Retry-After`, as métricas contam, e gravar uma linha por tentativa durante um incidente de banco só aumentaria a carga.
+   - No **HTTP** só são gravadas falhas **atribuíveis**, isto é, com `providerId` e `externalTransactionId` válidos. São as únicas que algum provedor consegue consultar. Gravar lixo anônimo deixaria qualquer cliente transformar requisições inválidas e baratas em linhas no banco, eventos na outbox e mensagens no broker (amplificação de escrita). As demais só incrementam a métrica `wager_submission_failures_total`. No SQS, que é canal interno, toda mensagem enviada à DLQ continua auditada.
 2. **`FAILED` em `wager_transactions` só para defeito confirmado.** Um erro **inesperado**, que não é de negócio nem transitório conhecido, e que sobreviveu a todas as tentativas no SQS indica bug. Nesse caso:
    - a transação é gravada como `FAILED(INFRA_PERMANENT_FAILURE)` com o saldo observado (inalterado) e **sem ledger**;
    - o evento `WagerTransactionFailed` é emitido;
@@ -300,7 +321,7 @@ Migrations escritas à mão, versionadas e reversíveis (`up`/`down`, testadas),
 | Toda alteração de saldo tem lançamento e vice-versa | *constraint triggers* **diferidos** `wallets_ledger_consistency` / `wallet_ledger_entries_wallet_consistency` |
 | Só transações `PROCESSED` que movem saldo têm ledger, com mesmo valor e moeda | constraint trigger diferido `ledger_entry_transaction_guard` |
 | Ledger e journal append-only | triggers `BEFORE UPDATE/DELETE/TRUNCATE` + `REVOKE` |
-| Idempotência | `UNIQUE (idempotency_key)`, `UNIQUE (provider_id, external_transaction_id)` |
+| Idempotência | `UNIQUE (provider_id, idempotency_key)`, `UNIQUE (provider_id, external_transaction_id)` |
 | Referência na mesma wallet | FK composta `(reference_transaction_id, wallet_id) → (id, wallet_id)` |
 | Reversão única | índice único **parcial** `(reference_transaction_id) WHERE kind IN ('REFUND','ROLLBACK') AND status='PROCESSED'` |
 | Transações terminais imutáveis; colunas de negócio sempre imutáveis; nada é deletado | trigger `wager_transactions_guard` |
@@ -421,7 +442,7 @@ sequenceDiagram
     Note over U,DB: conflito → duplicata: devolve resultado original (ack)
   end
   U->>DB: SELECT wallet FOR UPDATE
-  U->>DB: SELECT por idempotency_key OU (provider, externalId)
+  U->>DB: SELECT por (provider, idempotency_key) OU (provider, externalId)
   Note over U: existe e hash igual → replay · hash diferente → 409
   U->>DB: (se referência) SELECT referência + reversed?
   Note over U: WagerProcessor aplica as regras em memória
@@ -442,13 +463,69 @@ sequenceDiagram
 
 ## 7. Segurança
 
-- **Privilégio mínimo no banco:** o role de runtime só tem DML. Ledger e journal só aceitam `SELECT, INSERT`. As migrations rodam com outro role.
-- **Validação estrita na borda:** zod com `strictObject`, que rejeita chaves desconhecidas; ids com charset restrito e tamanho máximo; UUIDs validados; limite de body de 32 kB; `helmet`; `x-powered-by` desligado.
-- **SQL parametrizado** em todo lugar. `statement_timeout` e `lock_timeout` por transação.
+Visão de ponta a ponta, da borda ao banco. Cada camada assume que a anterior pode falhar.
+
+**1. Borda: nginx** (`docker/nginx/`, limites configuráveis por ambiente no serviço `lb`)
+
+| Proteção | Padrão | Contra |
+|---|---|---|
+| Taxa por IP (`limit_req`) | 500 r/s, burst 1000 sem atraso | rajada ou flood de um cliente |
+| Taxa extra na reconciliação | 10 r/s, burst 20 | abuso do endpoint caro (varre o ledger inteiro) |
+| Conexões simultâneas por IP (`limit_conn`) | 256 | esgotamento de conexões |
+| Timeouts de header, body e envio | 10 s | *slowloris* e clientes lentos |
+| Corpo e headers | 32 kB / 4×8 kB | payloads gigantes |
+| Métodos | só GET, HEAD e POST (o resto é `405`) | superfície desnecessária |
+| `/metrics` e `/health/ready` | `404` na borda | vazamento de dados internos (o Prometheus e as probes acessam as réplicas pela rede interna) |
+| `X-Forwarded-For` | sobrescrito com o IP real | IP de origem forjado pelo cliente |
+| `server_tokens off` | — | fingerprint de versão |
+
+- As recusas da borda seguem o contrato de erro da API: `429 {"code":"RATE_LIMITED"}` e falha de upstream `503 {"code":"TRANSIENT_FAILURE"}`, ambos com `Retry-After`.
+- O nginx gera um `X-Correlation-Id` quando o cliente não manda, e o mesmo id aparece nos logs da borda e da aplicação.
+- **Limites por IP são a última linha de defesa, não a principal.** Um provedor chama de poucos IPs, então esse limite precisa ser generoso. Em produção:
+  - ataques volumétricos (L3/L4 e L7 em massa) ficam com WAF/CDN (AWS WAF + Shield, Cloudflare);
+  - a **cota por provedor** fica no API gateway, chaveada pelo `client_id` autenticado.
+- Um throttler em memória dentro da aplicação não seria garantia com N réplicas, por isso não existe.
+
+**2. Autenticação e autorização** (ADR-09)
+- A autenticação é o ponto de extensão; a autorização é real.
+- Escopo obrigatório por rota, negando por padrão.
+- Provedor preso ao próprio `providerId`.
+- Transação de outro provedor responde `404`.
+- Criação de wallet (que cria dinheiro) e reconciliação só com o escopo de back-office.
+
+**3. Isolamento entre provedores**
+- Idempotency key e `externalTransactionId` são únicos **por provedor** (ADR-04).
+- Nenhuma resposta expõe dados de outro provedor.
+
+**4. Aplicação**
+- **Validação estrita:** zod com `strictObject`, que rejeita chaves desconhecidas; ids com charset restrito e tamanho máximo; UUIDs validados e normalizados.
+- **Headers:** `helmet` (`Cross-Origin-Resource-Policy: same-origin`, HSTS, `nosniff`); `x-powered-by` desligado.
+- **Sem amplificação de escrita:** só falhas atribuíveis são auditadas (ADR-12).
 - **Sem vazamento:** erros 500 não expõem detalhes. Logs não contêm valores, payloads nem credenciais (com `redact` como defesa em profundidade). O tracing de PostgreSQL não grava parâmetros.
+
+**5. Banco**
+- **Privilégio mínimo:** o role de runtime só tem DML. Ledger e journal só aceitam `SELECT, INSERT`. As migrations rodam com outro role.
+- **SQL parametrizado** em todo lugar. `statement_timeout` e `lock_timeout` por transação. O pool limita a concorrência que chega ao banco.
+
+**6. Operação**
 - **Container** non-root (`USER bun`), imagem slim e `.dockerignore` sem `.env`/`.git`/`test`.
-- **Configuração** validada no boot (fail fast). Segredos só por ambiente. `FAULT_INJECTION` é ignorado em `NODE_ENV=production`.
-- **Rate limiting** é responsabilidade do gateway. Um throttler em memória por instância não seria garantia com N réplicas.
+- **Configuração** validada no boot (fail fast). Segredos só por ambiente.
+- **`FAULT_INJECTION` só vale com `NODE_ENV=test`:** é opt-in. Um deploy que esqueça o `NODE_ENV` nunca consegue se derrubar.
+
+**CORS: não habilitado, por decisão.**
+- A API é servidor a servidor (provedores e back-office). Sem CORS, nenhum header `Access-Control-*` é enviado, e um navegador em outra origem não consegue ler respostas nem passar do preflight. Isso está testado.
+- CORS **não é autenticação**: não impede chamadas de servidores ou do `curl`. Quem protege a API são a autenticação, os escopos e os limites.
+- Se surgir um back-office web em outra origem, a regra é liberar só as origens dele, por ambiente (`app.enableCors({ origin: [...] })`), nunca `*`.
+
+**Canal SQS.**
+- A identidade do provedor na mensagem não é autenticada. Quem tem permissão de envio na fila age como qualquer provedor. Isso está documentado como canal interno confiável.
+- Em produção há duas saídas: uma fila (ou um `MessageGroupId` controlado) por provedor, com política de IAM por produtor, ou um envelope assinado (JWS) validado pelo consumidor.
+
+**Ambiente local ≠ produção.** O Compose usa coisas que não iriam para produção:
+- HTTP sem TLS: em produção o TLS fica no LB ou gateway, idealmente com mTLS para provedores;
+- senhas padrão;
+- Grafana com admin anônimo;
+- PostgreSQL e SQS expostos no host.
 
 ---
 
@@ -468,7 +545,7 @@ sequenceDiagram
 
 ## 9. Estratégia de testes
 
-São 204 testes. **Nenhum mock de PostgreSQL ou SQS**: integração e concorrência rodam contra PostgreSQL 17 e MiniStack reais (`docker-compose.test.yml`). Cada suíte usa um **banco isolado**, clonado de um template migrado (`CREATE DATABASE … TEMPLATE`), e **filas com sufixo único**. O invariante final roda ao fim de todas as suítes: `assertAllWalletsConsistent` verifica saldo = Σledger, a cadeia de versões contínua e a versão final igual à da wallet.
+São 215 testes. **Nenhum mock de PostgreSQL ou SQS**: integração e concorrência rodam contra PostgreSQL 17 e MiniStack reais (`docker-compose.test.yml`). Cada suíte usa um **banco isolado**, clonado de um template migrado (`CREATE DATABASE … TEMPLATE`), e **filas com sufixo único**. O invariante final roda ao fim de todas as suítes: `assertAllWalletsConsistent` verifica saldo = Σledger, a cadeia de versões contínua e a versão final igual à da wallet.
 
 | Exigência do enunciado | Onde |
 |---|---|
@@ -488,10 +565,11 @@ São 204 testes. **Nenhum mock de PostgreSQL ou SQS**: integração e concorrên
 | 7. ROLLBACK/REFUND antes da referência | `outbox-and-references.test.ts` (+ orçamento esgotado e 3 workers concorrentes) |
 | 8. reinício com prova de consistência | `multi-instance.test.ts` #8 (SIGKILL em todas as instâncias no meio do tráfego e restart) |
 | Auditoria e `FAILED` (ADR-12) | `submission-failures.test.ts` (HTTP: payload inválido, conflito, wallet inexistente, reenvio corrigido; SQS: erro inesperado esgotado → `FAILED`, poison message; imutabilidade), `sqs-consumer.test.ts` (transitória esgotada → `RETRIES_EXHAUSTED`, sem `FAILED`) |
+| Revisão de ponta a ponta | `hardening.test.ts` (UUID em maiúsculas vira a mesma requisição; chave de idempotência por provedor; `401`/`403`/escopos/`404` para transação de outro provedor com um adapter de identidade real; falha não atribuível não é gravada; CORS ausente), `wager-batch.test.ts` (UUID em lote; dependente de referência rejeitada acelerado), `schema-constraints.test.ts` (chave única por provedor) |
 | Lote por wallet (ADR-14) | `wager-batch.test.ts` (equivalência lote × sequencial, referência fora de ordem dentro do lote, lote com saldo líquido zero, `messageId` repetido, reentrega de lote inteiro, cenário obrigatório num lote, lotes concorrentes, referência de outra wallet), `sqs-batch.test.ts` (SQS real: N mensagens numa transação, poison no meio do grupo, fallback de wallet inexistente), `schema-constraints.test.ts` (salto de versão só com todas as linhas) |
 
 Ferramentas de suporte:
-- `FaultInjector`: pontos de crash só para teste, ignorados em produção;
+- `FaultInjector`: pontos de crash só para teste, ativos apenas com `NODE_ENV=test`;
 - `spawnInstance`: processos reais;
 - `waitFor`: polling determinístico com timeout, em vez de sleeps fixos.
 
@@ -500,11 +578,11 @@ Ferramentas de suporte:
 ## 10. Limitações conhecidas e próximos passos
 
 - **Reprocessar um `FAILED`.** Depois de corrigido o defeito, uma transação `FAILED` continua terminal. Reprocessá-la exige uma ferramenta operacional explícita (nova chave, ou anulação auditada do `FAILED`), que não foi implementada.
-- **Auditoria sem limite de taxa.** Um cliente que envia lixo em volume gera uma linha por requisição. A mitigação é rate limiting no gateway e a retenção de 90 dias.
+- **Auditoria por cliente autenticado.** Lixo anônimo já não gera linhas e o nginx limita a taxa por IP. Ainda assim, um provedor autenticado com defeito pode gerar uma linha por requisição inválida atribuível. A mitigação é a cota por provedor no gateway e a retenção de 90 dias.
 - **Contexto de trace na outbox.** O trace da requisição original não é gravado na outbox, então o span de publicação começa um trace novo. Próximo passo: adicionar uma coluna `traceparent`.
 - **Ordem entre publishers** é *best effort*. Os consumidores devem usar `walletVersion` e deduplicar por `eventId`.
 - **Testes de multi-processo e timing.** Uma execução isolada falhou no cenário #5 por mensagem residual de outro cenário. A causa foi corrigida com filas dedicadas, e depois disso foram 10 execuções seguidas sem falha. Como os testes dependem de tempo, um ambiente muito saturado pode aumentar a latência; os timeouts são generosos.
 - **Hot wallet no HTTP.** O lote só atua no SQS: no HTTP cada requisição é um lote de 1, e o teto continua sendo o tempo de lock. Juntar requisições HTTP da mesma wallet exigiria uma janela de espera e roteamento por wallet no load balancer; não foi feito.
 - **Lote e tráfego espalhado.** Com mensagens distribuídas por muitas wallets, cada receive traz ~1 mensagem por wallet e o lote não ajuda (ADR-14).
 - **Emulador.** Os números assíncronos no ambiente local refletem o MiniStack (Python, um core), não o SQS real.
-- **Autenticação** não implementada (veja o ADR-09). Rate limiting ficaria no gateway.
+- **Autenticação** não implementada (veja o ADR-09); a autorização por escopo está pronta para o adapter real. A cota por provedor ficaria no gateway, e a borda local só limita por IP.

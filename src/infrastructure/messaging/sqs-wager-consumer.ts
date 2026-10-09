@@ -58,6 +58,8 @@ export class SqsWagerConsumer {
   private poll: AbortController | undefined;
   private readonly inFlight = new Set<Promise<void>>();
   private readonly pending = new Set<Message>();
+  /** Visibility heartbeat per held message, from receive until it is settled or released. */
+  private readonly heartbeats = new Map<Message, ReturnType<typeof setInterval>>();
 
   constructor(
     private readonly sqs: SqsGateway,
@@ -87,6 +89,7 @@ export class SqsWagerConsumer {
     await Promise.race([Promise.allSettled([...this.inFlight]), Bun.sleep(graceMs)]);
     await Promise.allSettled([...this.pending].map((m) => this.release(m)));
     await this.loop?.catch(() => {});
+    for (const m of [...this.heartbeats.keys()]) this.stopHeartbeat(m); // abandoned work: let it time out
     this.logger.info({ worker: "sqs-consumer", abandoned: this.inFlight.size }, "worker stopped");
   }
 
@@ -123,17 +126,27 @@ export class SqsWagerConsumer {
     }
   }
 
+  /**
+   * Every message of the group is kept invisible from the moment it is received — including the ones still waiting
+   * for their turn behind slower predecessors (or in the batch fallback) — so a long group never lets a held
+   * message reappear and be redelivered while this instance still owns it.
+   */
   private async processGroup(group: Message[]): Promise<void> {
-    if (this.settings.batchPerWallet && group.length > 1) {
-      const batch = group.filter((m) => this.running || !this.pending.has(m)); // the rest is released on shutdown
-      for (const m of batch) this.pending.delete(m);
-      if (batch.length > 0) await this.handleBatch(batch);
-      return;
-    }
-    for (const message of group) {
-      if (!this.running && this.pending.has(message)) continue; // left for release() on shutdown
-      this.pending.delete(message);
-      await this.handle(message);
+    for (const m of group) this.startHeartbeat(m);
+    try {
+      if (this.settings.batchPerWallet && group.length > 1) {
+        const batch = group.filter((m) => this.running || !this.pending.has(m)); // the rest is released on shutdown
+        for (const m of batch) this.pending.delete(m);
+        if (batch.length > 0) await this.handleBatch(batch);
+        return;
+      }
+      for (const message of group) {
+        if (!this.running && this.pending.has(message)) continue; // left for release() on shutdown
+        this.pending.delete(message);
+        await this.handle(message);
+      }
+    } finally {
+      for (const m of group) if (!this.pending.has(m)) this.stopHeartbeat(m); // pending ones: release() stops them
     }
   }
 
@@ -152,12 +165,11 @@ export class SqsWagerConsumer {
           "messaging.receive_count": receiveCount,
         },
         async (span) => {
-          const heartbeat = this.startHeartbeat(message);
           let decision: Decision;
           try {
             decision = await this.decide(message, receiveCount);
           } finally {
-            clearInterval(heartbeat);
+            this.stopHeartbeat(message); // settling sets the visibility from here on
           }
           span.setAttribute("wagering.decision", decision.kind);
           await this.apply(message, decision, receiveCount);
@@ -294,7 +306,6 @@ export class SqsWagerConsumer {
         "wager-transactions process batch",
         { "messaging.system": "aws_sqs", "messaging.batch.message_count": messages.length },
         async (span) => {
-          const heartbeats = messages.map((m) => this.startHeartbeat(m));
           const decisions = new Map<Message, Decision>();
           const fallback: Message[] = [];
           try {
@@ -333,7 +344,8 @@ export class SqsWagerConsumer {
               }
             }
           } finally {
-            for (const h of heartbeats) clearInterval(h);
+            // Decided messages are settled below; fallback ones stay covered until handle() decides them.
+            for (const m of decisions.keys()) this.stopHeartbeat(m);
           }
           span.setAttribute("wagering.batch.fallback", fallback.length);
 
@@ -438,17 +450,25 @@ export class SqsWagerConsumer {
     }
   }
 
-  private startHeartbeat(message: Message): ReturnType<typeof setInterval> {
+  private startHeartbeat(message: Message): void {
+    if (this.heartbeats.has(message)) return;
     const every = Math.max(1, this.settings.visibilityTimeoutSeconds / 2) * 1000;
-    return setInterval(() => {
+    const timer = setInterval(() => {
       if (!message.ReceiptHandle) return;
       this.sqs
         .changeVisibility(message.ReceiptHandle, this.settings.visibilityTimeoutSeconds)
         .catch(() => {});
     }, every);
+    this.heartbeats.set(message, timer);
+  }
+
+  private stopHeartbeat(message: Message): void {
+    clearInterval(this.heartbeats.get(message));
+    this.heartbeats.delete(message);
   }
 
   private async release(message: Message): Promise<void> {
+    this.stopHeartbeat(message);
     if (!message.ReceiptHandle) return;
     this.pending.delete(message);
     await this.sqs.changeVisibility(message.ReceiptHandle, 0).catch(() => {});

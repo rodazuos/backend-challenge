@@ -128,6 +128,22 @@ A contagem de transações "desligado" fica abaixo do número de mensagens porqu
 
 Em todas as execuções: 0 erros e reconciliação consistente em todas as wallets tocadas.
 
+## Borda endurecida (nginx com rate limit)
+
+Depois da revisão de segurança, o nginx passou a aplicar limites por IP (ARCHITECTURE §7). Com os limites padrão, o teste de carga completo (uma execução de 20 s por cenário) passa sem erro:
+
+| Cenário | Resultado |
+|---|---|
+| distributed (64 VUs) | **397,7 req/s** · p99 358 ms · 8.044 × 201 |
+| hot-wallet (64 VUs) | 137,8 req/s · p99 1.085 ms · 2.821 × 201 |
+| reconciliação | 301/301 wallets consistentes |
+
+- **O nginx ficou mais rápido, não mais lento.** A borda passou a manter conexões keep-alive com as réplicas (antes, cada requisição abria uma conexão TCP). O ganho no cenário distribuído foi de ~340 para ~398 req/s, numa única execução: é preciso repetir para cravar o número.
+- **Um 502 apareceu na primeira tentativa, e foi corrigido.** A borda reusou uma conexão keep-alive que a aplicação fechava naquele instante (o keep-alive do servidor Bun/Node é de 5 s), e um POST nunca é repetido em outra réplica. O `keepalive_timeout` do upstream ficou em 4 s, abaixo do da aplicação. Além disso, um 502/504 da borda agora vira `503 TRANSIENT_FAILURE` com `Retry-After`, como no contrato da API.
+- **O runner aprendeu a esperar o 429.** A reconciliação final chama um endpoint com limite próprio (10 r/s por IP). O runner respeita o `Retry-After`, e uma wallet não verificada é reportada à parte (`unchecked`), nunca como "inconsistente".
+- **Benchmarks acima de ~500 req/s a partir de um único host** precisam subir o limite da borda: `LB_RATE_LIMIT_RPS=100000 LB_RATE_LIMIT_BURST=100000 docker compose up -d lb`.
+- O cenário SQS da mesma execução (18 msg/s) roda depois dos cenários HTTP, com a fila de eventos cheia no emulador. É a mesma contaminação por backlog descrita acima, não um efeito do nginx, que nem fica no caminho do SQS.
+
 ## O que o teste de carga encontrou (e foi corrigido)
 
 1. **Clock skew entre instâncias.** Na primeira execução, 26 de 8.130 requisições (0,32%) deram 500. A constraint `wallets_timestamps_ck` (`updated_at >= created_at`) rejeitou a escrita. A wallet foi criada pela réplica A às 42,571 e debitada pela réplica B, cujo relógio estava às 42,446: um skew de mais de 125 ms. Como o **schema recusou** o estado incoerente, nenhum dado ficou errado. A correção foi manter o `updatedAt` monotônico no domínio. Timestamps são informativos; a ordem é dada por `version`. Há teste unitário cobrindo. Depois da correção: 0 erros.

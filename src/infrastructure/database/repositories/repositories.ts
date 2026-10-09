@@ -10,6 +10,7 @@ import type { OutboxMessage } from "../../../modules/messaging/domain/outbox-mes
 import type {
   ClaimedPendingReference,
   ExternalRef,
+  IdempotencyRef,
   SubmissionFailureRepository,
   WagerTransactionRepository,
 } from "../../../modules/wagering/application/wagering-ports";
@@ -60,7 +61,7 @@ export class IdempotencyRaceError extends Error {
 }
 
 const IDEMPOTENCY_CONSTRAINTS = [
-  "wager_tx_idempotency_key_uk",
+  "wager_tx_provider_idempotency_uk",
   "wager_tx_provider_external_uk",
   "wager_tx_single_reversal_uk",
 ];
@@ -114,10 +115,6 @@ export class MikroWagerTransactionRepository implements WagerTransactionReposito
     return this.one({ id });
   }
 
-  async findByIdempotencyKey(idempotencyKey: string): Promise<WagerTransaction | undefined> {
-    return this.one({ idempotencyKey });
-  }
-
   async findByProviderExternalId(providerId: string, externalTransactionId: string) {
     return this.one({ providerId, externalTransactionId });
   }
@@ -125,7 +122,7 @@ export class MikroWagerTransactionRepository implements WagerTransactionReposito
   async findIdempotencyCandidates(idempotencyKey: string, providerId: string, externalTransactionId: string) {
     const rows = await this.em.find(
       WagerTransactionRecord,
-      { $or: [{ idempotencyKey }, { providerId, externalTransactionId }] },
+      { providerId, $or: [{ idempotencyKey }, { externalTransactionId }] },
       { disableIdentityMap: true, limit: 2 },
     );
     const txs = rows.map(wagerMapper.toDomain);
@@ -160,13 +157,13 @@ export class MikroWagerTransactionRepository implements WagerTransactionReposito
     }
   }
 
-  async findIdempotencyCandidatesMany(keys: readonly string[], pairs: readonly ExternalRef[]) {
+  async findIdempotencyCandidatesMany(keys: readonly IdempotencyRef[], pairs: readonly ExternalRef[]) {
     if (keys.length === 0 && pairs.length === 0) return [];
     const rows = await this.em.find(
       WagerTransactionRecord,
       {
         $or: [
-          ...(keys.length > 0 ? [{ idempotencyKey: { $in: [...keys] } }] : []),
+          ...keys.map((k) => ({ providerId: k.providerId, idempotencyKey: k.idempotencyKey })),
           ...pairs.map((p) => ({ providerId: p.providerId, externalTransactionId: p.externalTransactionId })),
         ],
       },
@@ -368,12 +365,17 @@ export class MikroInboxRepository implements InboxRepository {
 
   async tryInsertMany(messages: readonly InboxMessage[]): Promise<Set<string>> {
     if (messages.length === 0) return new Set();
+    // Rows are inserted (and their unique-index entries locked) in a fixed order: two batches that share
+    // messageIds can wait on each other but never deadlock.
+    const ordered = [...messages].sort((a, b) =>
+      a.messageId < b.messageId ? -1 : a.messageId > b.messageId ? 1 : 0,
+    );
     const rows = await this.em.execute<{ message_id: string }[]>(
       `INSERT INTO inbox_messages (consumer_name, message_id, payload_hash, received_at, processed_at)
-       VALUES ${messages.map(() => "(?, ?, ?, ?, ?)").join(", ")}
+       VALUES ${ordered.map(() => "(?, ?, ?, ?, ?)").join(", ")}
        ON CONFLICT (consumer_name, message_id) DO NOTHING
        RETURNING message_id`,
-      messages.flatMap((m) => [
+      ordered.flatMap((m) => [
         m.consumerName,
         m.messageId,
         m.payloadHash,

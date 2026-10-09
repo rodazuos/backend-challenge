@@ -50,6 +50,8 @@ export class CreateWallet {
     initialBalance: MoneyProps;
     correlationId: string;
   }): Promise<WalletView> {
+    // UUIDs are compared as strings in the domain; PostgreSQL returns them lower-case.
+    const playerId = cmd.playerId.toLowerCase();
     let initial: Money;
     try {
       initial = Money.from(cmd.initialBalance);
@@ -63,11 +65,11 @@ export class CreateWallet {
         const now = this.clock.now();
         const walletId = this.ids.next();
         const opening = initial.isPositive()
-          ? this.openingTransaction(walletId, cmd.playerId, initial, now)
+          ? this.openingTransaction(walletId, playerId, initial, now)
           : undefined;
         const { wallet, openingEntry } = Wallet.open({
           id: walletId,
-          playerId: cmd.playerId,
+          playerId,
           initialBalance: initial,
           at: now,
           opening: opening ? { transactionId: opening.id, ledgerEntryId: this.ids.next() } : undefined,

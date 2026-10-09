@@ -96,10 +96,21 @@ export class RecordSubmissionFailure {
     private readonly logger: AppLogger,
   ) {}
 
-  async execute(input: RecordFailureInput): Promise<SubmissionFailure | undefined> {
+  /**
+   * @param options.persist false = count it in metrics only (the caller decided the failure is not worth a row,
+   *        e.g. an unattributable HTTP request that no provider could ever query).
+   */
+  async execute(
+    input: RecordFailureInput,
+    options: { persist?: boolean } = {},
+  ): Promise<SubmissionFailure | undefined> {
     this.metrics.submissionFailure(input.channel, input.reasonCode);
     if (input.category === SubmissionFailureCategory.Conflict) {
       this.metrics.idempotencyConflict(input.channel, input.detail?.split(":")[0] ?? input.reasonCode);
+    }
+    if (options.persist === false) {
+      this.logger.debug({ reasonCode: input.reasonCode }, "unattributable submission failure (metrics only)");
+      return undefined;
     }
     try {
       const now = this.clock.now();

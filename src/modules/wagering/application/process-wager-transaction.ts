@@ -71,8 +71,18 @@ interface PreparedItem {
   payloadHash: string;
 }
 
-const extKey = (providerId: string, externalTransactionId: string) =>
-  `${providerId}\u0000${externalTransactionId}`;
+/** Map key for identifiers that are unique per provider (idempotency key, external transaction id). */
+const scoped = (providerId: string, value: string) => `${providerId}\u0000${value}`;
+
+/**
+ * UUIDs are case-insensitive and PostgreSQL returns them lower-case; the domain compares ids as strings. The
+ * transport contracts already normalise, this keeps every other caller of the use case equally safe.
+ */
+const normalizeIds = (cmd: SubmitWagerCommand): SubmitWagerCommand => ({
+  ...cmd,
+  walletId: cmd.walletId.toLowerCase(),
+  playerId: cmd.playerId.toLowerCase(),
+});
 
 /**
  * The single wagering use case shared by HTTP and SQS.
@@ -110,8 +120,9 @@ export class ProcessWagerTransaction {
    * @throws WalletNotFoundForSubmissionError when the wallet does not exist (nothing is committed);
    *         TransientInfrastructureError after bounded retries; unexpected errors roll the whole batch back.
    */
-  async executeBatch(cmds: readonly SubmitWagerCommand[]): Promise<BatchItemOutcome[]> {
-    if (cmds.length === 0) return [];
+  async executeBatch(submitted: readonly SubmitWagerCommand[]): Promise<BatchItemOutcome[]> {
+    if (submitted.length === 0) return [];
+    const cmds = submitted.map(normalizeIds);
     const walletId = cmds[0]?.walletId as string;
     if (cmds.some((c) => c.walletId !== walletId)) throw new Error("a batch must target a single wallet");
     const started = performance.now();
@@ -140,7 +151,8 @@ export class ProcessWagerTransaction {
    * Returns undefined when there is nothing valid to record against (unknown wallet, invalid contract), and the
    * existing transaction when the key was meanwhile processed (FAILED never overwrites a real outcome).
    */
-  async markFailed(cmd: SubmitWagerCommand, code: FailureCode): Promise<SubmitWagerResult | undefined> {
+  async markFailed(submitted: SubmitWagerCommand, code: FailureCode): Promise<SubmitWagerResult | undefined> {
+    const cmd = normalizeIds(submitted);
     const item = this.prepare(cmd);
     if ("error" in item) return undefined;
     return this.uow.transaction(
@@ -174,6 +186,8 @@ export class ProcessWagerTransaction {
             }),
           ),
         ]);
+        // Terminal: anything waiting on this transaction as its reference can be decided now.
+        await scope.wagers.nudgeDependents(tx.walletId, tx.providerId, tx.externalTransactionId, now);
         this.metrics.transactionOutcome({ kind: cmd.kind, status: tx.status, channel: cmd.channel });
         this.logger.error({ transactionId: tx.id, failureCode: code }, "wager transaction marked FAILED");
         return toResult(tx, false);
@@ -244,15 +258,16 @@ export class ProcessWagerTransaction {
     // 3. Idempotency (one query for every key and external id) — after the lock, so concurrent duplicates see
     //    committed originals.
     const undecided = live.filter((it) => out[it.i] === undefined);
+    //    Both keys are unique per provider: one provider can never see, replay or block another's submissions.
     const persisted = await scope.wagers.findIdempotencyCandidatesMany(
-      undecided.map((it) => it.cmd.idempotencyKey),
+      undecided.map((it) => ({ providerId: it.cmd.providerId, idempotencyKey: it.cmd.idempotencyKey })),
       undecided.map((it) => ({
         providerId: it.cmd.providerId,
         externalTransactionId: it.cmd.externalTransactionId,
       })),
     );
-    const byKey = new Map(persisted.map((t) => [t.idempotencyKey, t]));
-    const byExternal = new Map(persisted.map((t) => [extKey(t.providerId, t.externalTransactionId), t]));
+    const byKey = new Map(persisted.map((t) => [scoped(t.providerId, t.idempotencyKey), t]));
+    const byExternal = new Map(persisted.map((t) => [scoped(t.providerId, t.externalTransactionId), t]));
 
     // 4. References (one query) and which of them are already reversed (one query).
     const referencePairs = undecided
@@ -263,7 +278,7 @@ export class ProcessWagerTransaction {
       }));
     const references =
       referencePairs.length > 0 ? await scope.wagers.findByProviderExternalIds(referencePairs) : [];
-    for (const r of references) byExternal.set(extKey(r.providerId, r.externalTransactionId), r);
+    for (const r of references) byExternal.set(scoped(r.providerId, r.externalTransactionId), r);
     const reversed =
       references.length > 0
         ? await scope.wagers.reversedAmong(references.map((r) => r.id))
@@ -282,21 +297,21 @@ export class ProcessWagerTransaction {
 
       if (alreadyInInbox.has(it.i)) {
         // Redelivery of a committed message: answer with the original outcome.
-        const original = byKey.get(cmd.idempotencyKey);
+        const original = byKey.get(scoped(cmd.providerId, cmd.idempotencyKey));
         out[it.i] = original
           ? { ok: true, result: { ...toResult(original, true), duplicateMessage: true } }
           : conflict("INBOX_PAYLOAD_MISMATCH", { messageId: cmd.inbox?.messageId });
         continue;
       }
 
-      const existing = byKey.get(cmd.idempotencyKey);
+      const existing = byKey.get(scoped(cmd.providerId, cmd.idempotencyKey));
       if (existing) {
         out[it.i] = existing.matchesPayload(it.payloadHash)
           ? { ok: true, result: toResult(existing, true) }
           : conflict("PAYLOAD_MISMATCH", { idempotencyKey: cmd.idempotencyKey, transactionId: existing.id });
         continue;
       }
-      const sameExternal = byExternal.get(extKey(cmd.providerId, cmd.externalTransactionId));
+      const sameExternal = byExternal.get(scoped(cmd.providerId, cmd.externalTransactionId));
       if (sameExternal) {
         out[it.i] = conflict("EXTERNAL_ID_REUSED", {
           providerId: cmd.providerId,
@@ -320,7 +335,7 @@ export class ProcessWagerTransaction {
 
       let reference: ReferenceLookup | undefined;
       if (tx.referenceExternalTransactionId) {
-        const ref = byExternal.get(extKey(tx.providerId, tx.referenceExternalTransactionId));
+        const ref = byExternal.get(scoped(tx.providerId, tx.referenceExternalTransactionId));
         reference = ref
           ? {
               found: true,
@@ -342,12 +357,16 @@ export class ProcessWagerTransaction {
       });
 
       created.push(tx);
-      byKey.set(tx.idempotencyKey, tx);
-      byExternal.set(extKey(tx.providerId, tx.externalTransactionId), tx);
+      byKey.set(scoped(tx.providerId, tx.idempotencyKey), tx);
+      byExternal.set(scoped(tx.providerId, tx.externalTransactionId), tx);
       if (outcome.type === "PROCESSED") {
         if (outcome.ledgerEntry)
           ledger.push({ entry: outcome.ledgerEntry, counterpartyAccount: counterpartyAccountFor(tx) });
         if (tx.isReversal() && tx.referenceTransactionId) reversed.add(tx.referenceTransactionId);
+      }
+      // Any terminal outcome decides the dependents: PROCESSED unblocks them, REJECTED makes them
+      // REFERENCE_NOT_PROCESSED right away instead of after their next backoff.
+      if (outcome.type !== "PENDING_REFERENCE") {
         nudges.push({ providerId: tx.providerId, externalTransactionId: tx.externalTransactionId });
       }
       events.push(

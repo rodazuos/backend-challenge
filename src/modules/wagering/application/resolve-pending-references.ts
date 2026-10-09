@@ -109,8 +109,11 @@ export class ResolvePendingReferences {
         const meta = { correlationId: tx.idempotencyKey, causationId: tx.id, occurredAt: now };
         await scope.outbox.add(outboxMessagesFor(outcome, tx, wallet, meta, this.ids));
 
-        if (outcome.type === "PROCESSED") {
+        // Terminal either way: its own dependents can be decided now.
+        if (outcome.type !== "PENDING_REFERENCE") {
           await scope.wagers.nudgeDependents(wallet.id, tx.providerId, tx.externalTransactionId, now);
+        }
+        if (outcome.type === "PROCESSED") {
           this.logger.info({ kind: tx.kind }, "pending reference resolved");
           return "processed";
         }

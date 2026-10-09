@@ -219,6 +219,55 @@ describe("per-wallet batch", () => {
   });
 });
 
+describe("UUID case (regression)", () => {
+  test("upper-case ids in a batch are normalised: processed, never a defect or a false mismatch", async () => {
+    const w = await openWallet("100.00");
+    const upper = { id: w.id.toUpperCase(), playerId: w.playerId.toUpperCase() };
+    const outcomes = await h.core.processWager.executeBatch([
+      wagerCommand(upper, "BET", "10.00"),
+      wagerCommand(w, "BET", "10.00"),
+    ]);
+    expect(outcomes.map(shape)).toEqual([
+      { status: "PROCESSED", failureCode: null, balance: "90.00", replay: false },
+      { status: "PROCESSED", failureCode: null, balance: "80.00", replay: false },
+    ]);
+  });
+});
+
+describe("dependents of a rejected reference (regression)", () => {
+  test("are made due immediately and rejected as REFERENCE_NOT_PROCESSED, not after their backoff", async () => {
+    // Long backoff: without the nudge the dependent would only be looked at again in a minute.
+    const slow = await startCore({ PENDING_REF_BASE_MS: 60_000, PENDING_REF_MAX_MS: 600_000 });
+    try {
+      const w = await slow.core.createWallet.execute({
+        playerId: newPlayerId(),
+        initialBalance: { amount: "5.00", currency: "BRL" },
+        correlationId: "c",
+      });
+      const rollback = await slow.core.processWager.execute(
+        wagerCommand(w, "ROLLBACK", "50.00", { referenceExternalTransactionId: "big-bet" }),
+      );
+      expect(rollback.status as string).toBe("PENDING_REFERENCE");
+      const bigBet = await slow.core.processWager.execute(
+        wagerCommand(w, "BET", "50.00", { externalTransactionId: "big-bet" }),
+      );
+      expect(bigBet).toMatchObject({ status: "REJECTED", failureCode: "INSUFFICIENT_FUNDS" });
+
+      const [row] = await slow.db.query<{ due: boolean }>(
+        "SELECT next_reference_retry_at <= created_at + interval '1 second' AS due FROM wager_transactions WHERE id = $1",
+        [rollback.transactionId],
+      );
+      expect(row?.due).toBe(true);
+      await slow.core.resolvePendingReferences.runOnce();
+      const resolved = await slow.core.getWager.byId(rollback.transactionId);
+      expect(resolved).toMatchObject({ status: "REJECTED", failureCode: "REFERENCE_NOT_PROCESSED" });
+      await assertWalletConsistent(slow.db, w.id);
+    } finally {
+      await slow.close();
+    }
+  });
+});
+
 describe("cross-wallet reference (regression)", () => {
   test("a reference that belongs to another wallet is rejected (422), never a foreign-key error", async () => {
     const a = await openWallet();

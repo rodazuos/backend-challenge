@@ -2,8 +2,15 @@ import { Body, Controller, Get, Headers, HttpStatus, Param, Post, Query, Res } f
 import type { Response } from "express";
 import { z } from "zod";
 import { parseOrThrow } from "../../../../infrastructure/http/validation";
-import { TransientInfrastructureError } from "../../../../shared/application/errors";
+import { NotFoundError, TransientInfrastructureError } from "../../../../shared/application/errors";
 import { logContext } from "../../../../shared/application/observability";
+import {
+  canAccessProvider,
+  Principal,
+  type ProviderPrincipal,
+  RequireScope,
+  Scope,
+} from "../../../auth/provider-auth";
 import { ProcessWagerTransaction, type SubmitWagerResult } from "../../application/process-wager-transaction";
 import {
   classifySubmissionError,
@@ -15,7 +22,13 @@ import { GetWagerTransaction, type WagerTransactionView } from "../../applicatio
 import { computeWagerPayloadHash } from "../../domain/payload-hash";
 import type { ExternalWagerKind } from "../../domain/wager-transaction-kind";
 import { WagerTransactionStatus } from "../../domain/wager-transaction-kind";
-import { IdempotencyKeyContract, UuidParam, WagerPayloadContract } from "../contracts";
+import {
+  ExternalIdContract,
+  IdempotencyKeyContract,
+  ProviderIdContract,
+  UuidParam,
+  WagerPayloadContract,
+} from "../contracts";
 
 /**
  * Transaction outcome → HTTP status (identical for first execution and replays; `idempotentReplay`
@@ -42,6 +55,7 @@ export class WageringController {
   ) {}
 
   @Post("wagering/transactions")
+  @RequireScope(Scope.WagersSubmit)
   async submit(
     @Headers("idempotency-key") idempotencyKey: string | undefined,
     @Body() body: unknown,
@@ -73,6 +87,7 @@ export class WageringController {
 
   /** Audit trail for one provider transaction: why earlier submissions were refused (newest first). */
   @Get("providers/:providerId/wagering/transactions/:externalTransactionId/failures")
+  @RequireScope(Scope.WagersRead)
   failures(
     @Param("providerId") providerId: string,
     @Param("externalTransactionId") externalTransactionId: string,
@@ -82,12 +97,21 @@ export class WageringController {
     return this.listFailures.byExternalId(providerId, externalTransactionId, limit);
   }
 
+  /** Another provider's transaction answers 404, exactly like a missing one: ids cannot be probed. */
   @Get("wagering/transactions/:transactionId")
-  byId(@Param("transactionId") transactionId: string): Promise<WagerTransactionView> {
-    return this.getWager.byId(parseOrThrow(UuidParam, transactionId, "transactionId"));
+  @RequireScope(Scope.WagersRead)
+  async byId(
+    @Param("transactionId") transactionId: string,
+    @Principal() principal: ProviderPrincipal,
+  ): Promise<WagerTransactionView> {
+    const id = parseOrThrow(UuidParam, transactionId, "transactionId");
+    const view = await this.getWager.byId(id);
+    if (!canAccessProvider(principal, view.providerId)) throw new NotFoundError("transaction", id);
+    return view;
   }
 
   @Get("providers/:providerId/wagering/transactions/:externalTransactionId")
+  @RequireScope(Scope.WagersRead)
   byExternalId(
     @Param("providerId") providerId: string,
     @Param("externalTransactionId") externalTransactionId: string,
@@ -98,21 +122,31 @@ export class WageringController {
   /**
    * Transient failures (503) are not audited on HTTP: the caller already got a retryable answer synchronously,
    * metrics count them, and writing an audit row per attempt during a database incident would only add load.
+   *
+   * Only *attributable* failures are stored (valid providerId and externalTransactionId): they are the only ones a
+   * provider can ever query, and storing anonymous garbage would let any client turn cheap invalid requests into
+   * database rows, outbox events and broker messages. The rest is counted in metrics only.
    */
   private async audit(error: unknown, idempotencyKey: string | undefined, body: unknown): Promise<void> {
     if (error instanceof TransientInfrastructureError) return;
     const raw = (body && typeof body === "object" ? body : {}) as Record<string, unknown>;
     const str = (v: unknown) => (typeof v === "string" ? v : undefined);
     const parsed = WagerPayloadContract.safeParse(body);
+    const attributable =
+      ProviderIdContract.safeParse(raw.providerId).success &&
+      ExternalIdContract.safeParse(raw.externalTransactionId).success;
     const classification = classifySubmissionError(error);
-    await this.recordFailure.execute({
-      channel: "http",
-      ...classification,
-      providerId: str(raw.providerId),
-      externalTransactionId: str(raw.externalTransactionId),
-      idempotencyKey,
-      walletId: str(raw.walletId),
-      payloadHash: parsed.success ? computeWagerPayloadHash(parsed.data) : undefined,
-    });
+    await this.recordFailure.execute(
+      {
+        channel: "http",
+        ...classification,
+        providerId: str(raw.providerId),
+        externalTransactionId: str(raw.externalTransactionId),
+        idempotencyKey,
+        walletId: str(raw.walletId),
+        payloadHash: parsed.success ? computeWagerPayloadHash(parsed.data) : undefined,
+      },
+      { persist: attributable },
+    );
   }
 }

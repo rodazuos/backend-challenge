@@ -63,7 +63,12 @@ jobs:
       - name: Build and start the stack (3 replicas behind nginx)
         run: |
           docker compose up -d --build
-          for i in $(seq 1 90); do curl -fsS localhost:8080/health/ready && exit 0; sleep 2; done
+          # Readiness is internal-only (the edge answers 404 for it): probe a replica inside the network, then the edge.
+          ready="fetch('http://127.0.0.1:3000/health/ready').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+          for i in $(seq 1 90); do
+            docker compose exec -T app bun -e "$ready" && curl -fsS localhost:8080/health/live && exit 0
+            sleep 2
+          done
           docker compose ps; exit 1
       - name: End-to-end demo through the load balancer
         run: bun run scripts/demo.ts

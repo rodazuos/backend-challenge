@@ -1,4 +1,9 @@
-import { type RunningApplication, sqsGatewayFrom, startApplication } from "../../src/bootstrap";
+import {
+  type RunningApplication,
+  type StartOptions,
+  sqsGatewayFrom,
+  startApplication,
+} from "../../src/bootstrap";
 import { type AppConfig, loadConfig } from "../../src/config/config";
 import type { SqsGateway } from "../../src/infrastructure/messaging/sqs-gateway";
 import type { TestDatabase } from "./test-db";
@@ -52,9 +57,12 @@ export async function ensureQueues(env: Env): Promise<SqsGateway> {
   return sqs;
 }
 
-export async function startTestApp(env: Env): Promise<RunningApplication & { config: AppConfig }> {
+export async function startTestApp(
+  env: Env,
+  options: StartOptions = {},
+): Promise<RunningApplication & { config: AppConfig }> {
   const config = loadConfig(env);
-  const app = await startApplication(config);
+  const app = await startApplication(config, options);
   return Object.assign(app, { config });
 }
 

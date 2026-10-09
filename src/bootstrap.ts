@@ -15,6 +15,7 @@ import { createLogger, type Logger, NestPinoLogger } from "./infrastructure/obse
 import { PromMetrics } from "./infrastructure/observability/metrics";
 import { PendingReferenceWorker, RetentionWorker } from "./infrastructure/workers/background-workers";
 import { FaultInjector } from "./infrastructure/workers/fault-injector";
+import type { ProviderIdentityPort } from "./modules/auth/provider-auth";
 
 export interface RunningApplication {
   url: string;
@@ -43,7 +44,15 @@ export function sqsGatewayFrom(config: AppConfig): SqsGateway {
  * Builds and starts one instance. Roles (APP_ROLES) choose which loops run here; every instance serves
  * HTTP (health/metrics at least) so it can be probed. All roles are stateless and safe to run N times.
  */
-export async function startApplication(config: AppConfig): Promise<RunningApplication> {
+export interface StartOptions {
+  /** Authentication adapter (defaults to the no-op one). Tests inject a real one to exercise authorisation. */
+  identity?: ProviderIdentityPort;
+}
+
+export async function startApplication(
+  config: AppConfig,
+  options: StartOptions = {},
+): Promise<RunningApplication> {
   const logger = createLogger({
     level: config.LOG_LEVEL,
     service: config.OTEL_SERVICE_NAME,
@@ -135,7 +144,7 @@ export async function startApplication(config: AppConfig): Promise<RunningApplic
     : undefined;
 
   const app = await NestFactory.create<NestExpressApplication>(
-    AppModule.register({ core, metrics, readiness }),
+    AppModule.register({ core, metrics, readiness, identity: options.identity }),
     {
       logger: new NestPinoLogger(logger),
       bodyParser: true,

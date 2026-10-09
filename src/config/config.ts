@@ -69,7 +69,7 @@ const EnvSchema = z.object({
   OTEL_EXPORTER_OTLP_ENDPOINT: z.string().url().optional(),
   OTEL_SERVICE_NAME: z.string().default("wagering-processor"),
 
-  /** Test-only crash points, e.g. "after-commit-before-ack". Ignored in production. */
+  /** Test-only crash points, e.g. "after-commit-before-ack". Honoured only when NODE_ENV=test (opt-in, fail safe). */
   FAULT_INJECTION: z.string().default(""),
 });
 
@@ -87,8 +87,9 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     throw new Error(`Invalid configuration:\n${issues}`);
   }
   const cfg = parsed.data;
+  // Opt-in by environment, not opt-out: a deployment that forgets NODE_ENV must never be able to kill itself.
   const faults =
-    cfg.NODE_ENV === "production"
+    cfg.NODE_ENV !== "test"
       ? []
       : cfg.FAULT_INJECTION.split(",")
           .map((f) => f.trim())

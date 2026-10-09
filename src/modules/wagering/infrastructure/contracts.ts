@@ -13,19 +13,30 @@ const id = (max: number) =>
     .max(max)
     .regex(/^[A-Za-z0-9._:-]+$/, "only letters, digits and . _ : - are allowed");
 
+/**
+ * UUIDs are case-insensitive, but PostgreSQL returns them lower-case and the domain compares ids as strings.
+ * Normalising here (before the payload hash) makes "A1B2…" and "a1b2…" the same request instead of a 500 or a
+ * spurious WALLET_PLAYER_MISMATCH.
+ */
+const uuid = () => z.uuid().transform((v) => v.toLowerCase());
+
 export const MoneyContract = z.strictObject({
   amount: z.string(),
   currency: z.string(),
 });
 
 /** "system" is reserved for internal OPENING transactions. */
-const providerId = id(64).refine((v) => v.toLowerCase() !== "system", "providerId 'system' is reserved");
+export const ProviderIdContract = id(64).refine(
+  (v) => v.toLowerCase() !== "system",
+  "providerId 'system' is reserved",
+);
+export const ExternalIdContract = id(128);
 
 export const WagerPayloadContract = z.strictObject({
-  providerId,
-  externalTransactionId: id(128),
-  playerId: z.uuid(),
-  walletId: z.uuid(),
+  providerId: ProviderIdContract,
+  externalTransactionId: ExternalIdContract,
+  playerId: uuid(),
+  walletId: uuid(),
   roundId: id(128),
   gameId: id(128),
   kind: z.enum(EXTERNAL_KINDS.map(String) as [string, ...string[]]),
@@ -51,7 +62,7 @@ export const WagerMessageContract = z.strictObject({
 export type WagerMessage = z.infer<typeof WagerMessageContract>;
 
 export const CreateWalletContract = z.strictObject({
-  playerId: z.uuid(),
+  playerId: uuid(),
   initialBalance: MoneyContract,
 });
 
@@ -60,4 +71,4 @@ export const LedgerQueryContract = z.strictObject({
   limit: z.coerce.number().int().min(1).max(200).default(50),
 });
 
-export const UuidParam = z.uuid();
+export const UuidParam = uuid();

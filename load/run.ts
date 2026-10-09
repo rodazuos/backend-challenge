@@ -75,7 +75,7 @@ async function post(path: string, body: unknown, headers: Record<string, string>
     body: JSON.stringify(body),
   });
   const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-  return { status: res.status, body: json };
+  return { status: res.status, body: json, headers: res.headers };
 }
 
 async function createWallets(n: number, amount: string): Promise<Wallet[]> {
@@ -278,21 +278,31 @@ async function runSqsScenario(db: Client, wallets: Wallet[]) {
   };
 }
 
+/** The edge rate-limits reconciliation (expensive endpoint): 429 is waited out, never counted as a divergence. */
+async function reconcileOne(w: Wallet) {
+  for (let attempt = 0; attempt < 30; attempt++) {
+    const r = await post(`/wallets/${w.id}/reconciliation`, {});
+    if (r.status !== 429) return r;
+    await Bun.sleep(1000 * Number(r.headers.get("retry-after") ?? 1));
+  }
+  return post(`/wallets/${w.id}/reconciliation`, {});
+}
+
 async function reconcile(wallets: Wallet[]) {
   let consistent = 0;
   const inconsistent: string[] = [];
+  const unchecked: string[] = [];
   for (let i = 0; i < wallets.length; i += 25) {
     const reports = await Promise.all(
-      wallets
-        .slice(i, i + 25)
-        .map((w) => post(`/wallets/${w.id}/reconciliation`, {}).then((r) => ({ w, r }))),
+      wallets.slice(i, i + 25).map((w) => reconcileOne(w).then((r) => ({ w, r }))),
     );
     for (const { w, r } of reports) {
-      if (r.body.consistent === true) consistent++;
+      if (r.status !== 200) unchecked.push(w.id);
+      else if (r.body.consistent === true) consistent++;
       else inconsistent.push(w.id);
     }
   }
-  return { checked: wallets.length, consistent, inconsistent };
+  return { checked: wallets.length, consistent, inconsistent, unchecked };
 }
 
 // ------------------------------------------------------------------ main
@@ -379,7 +389,7 @@ const file = `load/results/${environment.date.replace(/[:.]/g, "-")}.json`;
 await Bun.write(file, JSON.stringify(report, null, 2));
 console.log(`\nreport written to ${file}`);
 await db.end();
-if (reconciliation.inconsistent.length > 0) process.exit(1);
+if (reconciliation.inconsistent.length > 0 || reconciliation.unchecked.length > 0) process.exit(1);
 
 function startEventSink() {
   const events = new SqsGateway({

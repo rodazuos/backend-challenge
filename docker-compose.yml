@@ -77,12 +77,22 @@ services:
       bootstrap:
         condition: service_completed_successfully
 
+  # Edge: load balancing + per-IP rate/connection limits, slow-client timeouts, internal endpoints hidden.
+  # Benchmarks from a single host may need higher limits, e.g. LB_RATE_LIMIT_RPS=100000 docker compose up -d lb
   lb:
     image: nginx:1.29-alpine
     ports:
       - "8080:80"
+    environment:
+      LB_RATE_LIMIT_RPS: ${LB_RATE_LIMIT_RPS:-500}
+      LB_RATE_LIMIT_BURST: ${LB_RATE_LIMIT_BURST:-1000}
+      LB_HEAVY_RATE_LIMIT_RPS: ${LB_HEAVY_RATE_LIMIT_RPS:-10}
+      LB_HEAVY_RATE_LIMIT_BURST: ${LB_HEAVY_RATE_LIMIT_BURST:-20}
+      LB_MAX_CONN_PER_IP: ${LB_MAX_CONN_PER_IP:-256}
     volumes:
       - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/nginx/proxy.inc:/etc/nginx/proxy.inc:ro
+      - ./docker/nginx/templates:/etc/nginx/templates:ro
     depends_on:
       - app
 
